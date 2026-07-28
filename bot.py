@@ -12,8 +12,8 @@ DB_NAME = "kino_bot.db"
 
 # RichAds / AdX1 API sozlamalari
 AD_API_URL = os.getenv("AD_API_URL", "http://15068.xml.adx1.com/telegram-mb")
-PUBLISHER_ID = os.getenv("PUBLISHER_ID", "792361")
-WIDGET_ID = os.getenv("WIDGET_ID", "351352")
+PUBLISHER_ID = os.getenv("PUBLISHER_ID", "1018576")
+WIDGET_ID = os.getenv("WIDGET_ID", "402831")
 BID_FLOOR = float(os.getenv("BID_FLOOR", "0.0001"))
 PRODUCTION = os.getenv("PRODUCTION", "true").lower() == "true"
 
