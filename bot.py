@@ -1,882 +1,663 @@
-# bot.py
-# RichAds reklamali kino bot (Webhook versiya)
-# Python 3.10+
-#
-# O‘rnatish:
-#   pip install pyTelegramBotAPI flask
-#
-# Ishga tushirishdan oldin quyidagilarni almashtiring:
-#   BOT_TOKEN
-#   ADMIN_IDS
-#   RICHADS_POSTBACK_SECRET
-
-import html
-import logging
-import os
-import re
-import sqlite3
-import threading
-import time
-import uuid
+# bot.py (1/3)
+import html, logging, os, re, sqlite3, threading, time, uuid
 from datetime import datetime
-
 import telebot
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 from flask import Flask, request, jsonify
 
-# =========================================================
-# SOZLAMALAR
-# =========================================================
-
+# ---------- SOZLAMALAR ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-ADMIN_IDS = {
-    int(value.strip())
-    for value in os.getenv("ADMIN_IDS", "").split(",")
-    if value.strip().isdigit()
-}
-
+ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 DB_NAME = "kino_bot.db"
-
-# RichAds postback sirli kaliti – xavfsizlik uchun.
 RICHADS_POSTBACK_SECRET = os.getenv("RICHADS_POSTBACK_SECRET", "change_me_123")
 
 if not BOT_TOKEN or ":" not in BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN noto‘g‘ri. Environment bo‘limiga haqiqiy BotFather tokenini kiriting."
-    )
+    raise RuntimeError("BOT_TOKEN noto‘g‘ri")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 
-# =========================================================
-# MA’LUMOTLAR BAZASI
-# =========================================================
-
+# ---------- BAZA ----------
 db_lock = threading.RLock()
-
 def db_connect():
-    connection = sqlite3.connect(
-        DB_NAME,
-        timeout=30,
-        check_same_thread=False,
-    )
-    connection.row_factory = sqlite3.Row
-    return connection
-
-def execute(query: str, params: tuple = (), fetchone=False, fetchall=False):
+    c = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
+def execute(q, p=(), fetchone=False, fetchall=False):
     with db_lock:
         conn = db_connect()
         try:
-            cursor = conn.execute(query, params)
+            cur = conn.execute(q, p)
             conn.commit()
-
-            if fetchone:
-                return cursor.fetchone()
-            if fetchall:
-                return cursor.fetchall()
-            return cursor.lastrowid
-        finally:
-            conn.close()
+            if fetchone: return cur.fetchone()
+            if fetchall: return cur.fetchall()
+            return cur.lastrowid
+        finally: conn.close()
 
 def init_db():
-    execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT NOT NULL DEFAULT '',
-            username TEXT NOT NULL DEFAULT '',
-            is_blocked INTEGER NOT NULL DEFAULT 0,
-            joined_at TEXT NOT NULL,
-            last_active TEXT NOT NULL
-        )
-    """)
+    execute("""CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY, full_name TEXT DEFAULT '', username TEXT DEFAULT '',
+        is_blocked INTEGER DEFAULT 0, joined_at TEXT, last_active TEXT,
+        free_movies_count INTEGER DEFAULT 0,
+        pending_ads_required INTEGER DEFAULT 0,
+        pending_ads_completed INTEGER DEFAULT 0,
+        pending_movie_id INTEGER
+    )""")
+    # oldingi foydalanuvchilarda yangi ustunlar bo'lmasa qo'shish
+    for col in ["free_movies_count", "pending_ads_required", "pending_ads_completed", "pending_movie_id"]:
+        try: execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0")
+        except: pass
 
-    execute("""
-        CREATE TABLE IF NOT EXISTS movies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL,
-            title TEXT NOT NULL,
-            caption TEXT NOT NULL,
-            file_id TEXT NOT NULL,
-            file_type TEXT NOT NULL DEFAULT 'video',
-            views INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            added_by INTEGER NOT NULL
-        )
-    """)
-
-    execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            message_text TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            answered INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-
-    execute("""
-        CREATE TABLE IF NOT EXISTS states (
-            user_id INTEGER PRIMARY KEY,
-            state TEXT NOT NULL,
-            data TEXT NOT NULL DEFAULT ''
-        )
-    """)
-
-    execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    """)
-
-    execute("""
-        CREATE TABLE IF NOT EXISTS watch_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            movie_id INTEGER NOT NULL,
-            watched_at TEXT NOT NULL
-        )
-    """)
-
-    execute("""
-        CREATE TABLE IF NOT EXISTS search_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            code TEXT NOT NULL,
-            found INTEGER NOT NULL,
-            searched_at TEXT NOT NULL
-        )
-    """)
-
-    # RichAds reklama jadvali
-    execute("""
-        CREATE TABLE IF NOT EXISTS ad_views (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            movie_id INTEGER NOT NULL,
-            click_id TEXT UNIQUE NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    # Standart reklama sozlamalari
-    for key, value in [
+    execute("""CREATE TABLE IF NOT EXISTS movies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, title TEXT,
+        caption TEXT, file_id TEXT, file_type TEXT DEFAULT 'video',
+        views INTEGER DEFAULT 0, created_at TEXT, added_by INTEGER
+    )""")
+    execute("""CREATE TABLE IF NOT EXISTS channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT,
+        username TEXT UNIQUE, invite_link TEXT, chat_id INTEGER
+    )""")
+    execute("""CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+        message_text TEXT, created_at TEXT, answered INTEGER DEFAULT 0
+    )""")
+    execute("""CREATE TABLE IF NOT EXISTS states (
+        user_id INTEGER PRIMARY KEY, state TEXT, data TEXT DEFAULT ''
+    )""")
+    execute("""CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY, value TEXT
+    )""")
+    execute("""CREATE TABLE IF NOT EXISTS watch_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+        movie_id INTEGER, watched_at TEXT
+    )""")
+    execute("""CREATE TABLE IF NOT EXISTS search_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+        code TEXT, found INTEGER, searched_at TEXT
+    )""")
+    execute("""CREATE TABLE IF NOT EXISTS ad_views (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+        movie_id INTEGER, click_id TEXT UNIQUE, status TEXT DEFAULT 'pending',
+        created_at TEXT
+    )""")
+    execute("""CREATE TABLE IF NOT EXISTS join_requests (
+        user_id INTEGER, chat_id INTEGER, request_date TEXT,
+        PRIMARY KEY (user_id, chat_id)
+    )""")
+    # standart sozlamalar
+    for k,v in [
         ("richads_campaign_id", "1018576"),
         ("richads_link_template", "https://richads.com/c/{campaign_id}?sub_id={sub_id}"),
-        ("required_ads", "1"),
         ("richads_min_floor", "0.01"),
         ("richads_lang", "uz"),
+        ("free_movies_limit", "3"),     # nechta kino bepul ko‘riladi
+        ("ads_after_limit", "2"),       # limitdan keyin nechta reklama
     ]:
-        execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
-            (key, value),
-        )
+        execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k,v))
 
-# =========================================================
-# YORDAMCHI FUNKSIYALAR
-# =========================================================
+init_db()
 
-def now_text():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# ---------- YORDAMCHILAR ----------
+def now_text(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def safe(v): return html.escape(str(v or ""))
+def is_admin(uid): return uid in ADMIN_IDS
+def get_setting(key):
+    r = execute("SELECT value FROM settings WHERE key=?", (key,), fetchone=True)
+    return r["value"] if r else ""
+def set_setting(key,val):
+    execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key,val))
 
-def safe(value):
-    return html.escape(str(value or ""))
-
-def is_admin(user_id: int):
-    return user_id in ADMIN_IDS
-
-def get_setting(key: str):
-    row = execute(
-        "SELECT value FROM settings WHERE key=?",
-        (key,),
-        fetchone=True,
-    )
-    return row["value"] if row else ""
-
-def set_setting(key: str, value: str):
-    execute("""
-        INSERT INTO settings(key, value)
-        VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (key, value))
-
-def set_state(user_id: int, state: str, data: str = ""):
-    execute("""
-        INSERT INTO states(user_id, state, data)
-        VALUES(?, ?, ?)
-        ON CONFLICT(user_id)
-        DO UPDATE SET state=excluded.state, data=excluded.data
-    """, (user_id, state, data))
-
-def get_state(user_id: int):
-    row = execute(
-        "SELECT state, data FROM states WHERE user_id=?",
-        (user_id,),
-        fetchone=True,
-    )
-    if not row:
-        return None, ""
-    return row["state"], row["data"]
-
-def clear_state(user_id: int):
-    execute("DELETE FROM states WHERE user_id=?", (user_id,))
+def set_state(uid,state,data=""):
+    execute("INSERT INTO states(user_id,state,data) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET state=excluded.state, data=excluded.data", (uid,state,data))
+def get_state(uid):
+    r = execute("SELECT state,data FROM states WHERE user_id=?",(uid,), fetchone=True)
+    return (None,"") if not r else (r["state"], r["data"])
+def clear_state(uid): execute("DELETE FROM states WHERE user_id=?",(uid,))
 
 def register_user(user):
-    username = f"@{user.username}" if user.username else ""
-    full_name = " ".join(
-        part for part in [user.first_name, user.last_name] if part
-    ).strip()
+    name = " ".join(filter(None,[user.first_name, user.last_name])).strip()
+    uname = f"@{user.username}" if user.username else ""
+    execute("""INSERT INTO users(user_id,full_name,username,joined_at,last_active)
+               VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+               full_name=excluded.full_name, username=excluded.username,
+               last_active=excluded.last_active""",
+            (user.id, name, uname, now_text(), now_text()))
+def get_user(uid): return execute("SELECT * FROM users WHERE user_id=?",(uid,), fetchone=True)
 
-    execute("""
-        INSERT INTO users(
-            user_id, full_name, username, joined_at, last_active
-        )
-        VALUES(?, ?, ?, ?, ?)
-        ON CONFLICT(user_id)
-        DO UPDATE SET
-            full_name=excluded.full_name,
-            username=excluded.username,
-            last_active=excluded.last_active
-    """, (
-        user.id,
-        full_name,
-        username,
-        now_text(),
-        now_text(),
-    ))
+# ========== MAJBURIY OBUNA ==========
+def get_channels():
+    return execute("SELECT * FROM channels ORDER BY id", fetchall=True)
 
-def get_user(user_id: int):
-    return execute(
-        "SELECT * FROM users WHERE user_id=?",
-        (user_id,),
-        fetchone=True,
-    )
+def check_subscription(user_id):
+    for ch in get_channels():
+        try:
+            if ch["username"] and ch["username"].startswith("private_"):
+                if not ch["chat_id"]: continue
+                chat_id = ch["chat_id"]
+            elif ch["username"]: chat_id = ch["username"]
+            elif ch["chat_id"]:  chat_id = ch["chat_id"]
+            else: continue
+            member = bot.get_chat_member(chat_id, user_id)
+            if member.status not in ("creator","administrator","member"):
+                return False
+        except ApiTelegramException as e:
+            logging.warning(f"Obuna tekshirishda kanal {ch['id']}: {e}")
+        except Exception as e:
+            logging.error(f"Kutilmagan xato: {e}")
+    return True
 
+def subscription_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for ch in get_channels():
+        title = ch.get("title") or "Kanal"
+        if ch.get("username") and not ch["username"].startswith("private_"):
+            name = ch["username"].replace("@","").strip()
+            if name: kb.add(types.InlineKeyboardButton(f"📢 {title}", url=f"https://t.me/{name}"))
+        elif ch.get("invite_link"):
+            kb.add(types.InlineKeyboardButton(f"📩 {title} – so‘rov yuborish", url=ch["invite_link"]))
+    kb.add(types.InlineKeyboardButton("✅ Obunani tekshirish", callback_data="check_subscription"))
+    return kb
+
+def send_subscription_required(chat_id):
+    kb = subscription_keyboard()
+    bot.send_message(chat_id,
+        "🔐 <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:</b>\n\n"
+        "📢 <b>Ochiq kanallar</b> — havola orqali kirib <b>Join</b> tugmasini bosing.\n"
+        "📩 <b>Maxfiy kanallar</b> — <b>So'rov yuborish</b> tugmasini bosing.\n\n"
+        "So‘ngra <b>✅ Obunani tekshirish</b> tugmasini bosing.",
+        reply_markup=kb)
+
+@bot.chat_join_request_handler()
+def handle_join_request(req: types.ChatJoinRequest):
+    try:
+        bot.approve_chat_join_request(req.chat.id, req.from_user.id)
+        execute("INSERT OR IGNORE INTO join_requests VALUES(?,?,?)",
+                (req.from_user.id, req.chat.id, now_text()))
+    except Exception as e:
+        logging.error(f"Join request xato: {e}")
+
+@bot.callback_query_handler(func=lambda c: c.data == "check_subscription")
+def check_sub_cb(call):
+    register_user(call.from_user)
+    if check_subscription(call.from_user.id):
+        bot.answer_callback_query(call.id, "Obuna tasdiqlandi ✅")
+        try: bot.edit_message_text("✅ <b>Obunangiz tasdiqlandi.</b>", call.message.chat.id, call.message.message_id)
+        except: pass
+        open_main_menu(call.message.chat.id, call.from_user.id)
+    else:
+        bot.answer_callback_query(call.id, "Hali barcha kanallarga obuna bo‘lmadingiz.", show_alert=True)
+
+# ---------- MENYULAR ----------
+def main_keyboard(uid):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add("🔎 Kino kodi", "🔥 Eng mashhur kinolar")
+    kb.add("📊 Statistika", "💬 Adminga xabar", "👤 Profil")
+    if is_admin(uid): kb.add("🛠 Admin panel")
+    return kb
+
+def admin_keyboard():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add("🎬 Kinolar", "⚙️ Reklama sozlamalari")
+    kb.add("👥 Foydalanuvchilar", "📡 Kanallar")
+    kb.add("📢 Reklama yuborish", "📊 Statistika")
+    kb.add("🏠 Asosiy menyu")
+    return kb
+
+def movies_keyboard():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add("➕ Kino qo‘shish", "🗑 Kino o‘chirish")
+    kb.add("📋 Barcha kinolar", "🔙 Admin panelga qaytish")
+    return kb
+
+def open_main_menu(chat_id, uid):
+    bot.send_message(chat_id, "🎬 <b>Kino botga xush kelibsiz!</b>\nKerakli bo‘limni tanlang:",
+                     reply_markup=main_keyboard(uid))
+
+# ---------- KIRISH NAZORATI ----------
+def ensure_access(message):
+    register_user(message.from_user)
+    uid = message.from_user.id
+    user = get_user(uid)
+    if user and user["is_blocked"]:
+        bot.send_message(message.chat.id, "🚫 Siz botdan bloklangansiz.")
+        return False
+    if not check_subscription(uid):
+        send_subscription_required(message.chat.id)
+        return False
+    return True
+
+# ---------- START / ADMIN ----------
+@bot.message_handler(commands=["start"])
+def start_handler(message):
+    if not ensure_access(message): return
+    clear_state(message.from_user.id)
+    open_main_menu(message.chat.id, message.from_user.id)
+
+@bot.message_handler(commands=["admin"])
+def admin_cmd(message):
+    if not is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "❌ Siz admin emassiz.")
+        return
+    clear_state(message.from_user.id)
+    bot.send_message(message.chat.id, "🛠 <b>Admin panel</b>", reply_markup=admin_keyboard())
+
+@bot.message_handler(func=lambda m: m.text == "🏠 Asosiy menyu")
+def home_btn(message):
+    if not ensure_access(message): return
+    clear_state(message.from_user.id)
+    open_main_menu(message.chat.id, message.from_user.id)
+
+@bot.message_handler(func=lambda m: m.text == "🛠 Admin panel")
+def admin_panel_btn(message):
+    if not is_admin(message.from_user.id): return
+    clear_state(message.from_user.id)
+    bot.send_message(message.chat.id, "🛠 <b>Admin panel</b>", reply_markup=admin_keyboard())
 # =========================================================
-# RichAds REKLAMA TIZIMI
+# 2-QISM: Asosiy bot logikasi – kino qidirish, admin,
+#         majburiy kanallar, reklama tizimi, holatlar
 # =========================================================
 
+# ========== REKLAMA (RichAds) ==========
 def get_richads_link(sub_id: str):
     template = get_setting("richads_link_template")
     campaign_id = get_setting("richads_campaign_id")
     return template.format(campaign_id=campaign_id, sub_id=sub_id)
 
-def ad_required_for_movie(user_id: int, movie_id: int):
-    required = int(get_setting("required_ads"))
-    completed = execute(
-        "SELECT COUNT(*) AS cnt FROM ad_views WHERE user_id=? AND movie_id=? AND status='completed'",
-        (user_id, movie_id),
-        fetchone=True,
-    )["cnt"]
-    return completed < required
-
-def send_ad_and_track(user_id: int, chat_id: int, movie_id: int):
-    required = int(get_setting("required_ads"))
-    completed = execute(
-        "SELECT COUNT(*) AS cnt FROM ad_views WHERE user_id=? AND movie_id=? AND status='completed'",
-        (user_id, movie_id),
-        fetchone=True,
-    )["cnt"]
-    remaining = required - completed
+def send_ad_and_track(user_id: int, chat_id: int):
+    """Foydalanuvchiga bitta reklama yuboradi va kuzatuvga oladi."""
+    user = get_user(user_id)
+    pending_movie_id = user["pending_movie_id"]
 
     click_id = str(uuid.uuid4())
     execute(
         "INSERT INTO ad_views(user_id, movie_id, click_id, status, created_at) VALUES(?, ?, ?, 'pending', ?)",
-        (user_id, movie_id, click_id, now_text()),
+        (user_id, pending_movie_id, click_id, now_text()),
     )
 
     link = get_richads_link(click_id)
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(types.InlineKeyboardButton("📣 Reklamani ko‘rish", url=link))
 
+    remaining = user["pending_ads_required"] - user["pending_ads_completed"]
     bot.send_message(
         chat_id,
-        f"📺 <b>Kinoni tomosha qilish uchun {remaining} ta reklama ko‘rishingiz kerak.</b>\n\n"
-        f"Quyidagi tugmani bosing va reklama yakunlangach kino avtomatik yuboriladi.",
+        f"📺 <b>Kinoni ochish uchun {remaining} ta reklama ko‘rishingiz kerak.</b>\n\n"
+        "Quyidagi tugmani bosing va reklama yakunlangach kino avtomatik yuboriladi.",
         reply_markup=keyboard,
     )
 
 def process_ad_completion(click_id: str):
+    """Postback kelganda bajariladi."""
     ad = execute(
         "SELECT * FROM ad_views WHERE click_id=? AND status='pending'",
-        (click_id,),
-        fetchone=True,
+        (click_id,), fetchone=True,
     )
     if not ad:
         return False
 
-    execute(
-        "UPDATE ad_views SET status='completed' WHERE id=?",
-        (ad["id"],),
-    )
-
+    execute("UPDATE ad_views SET status='completed' WHERE id=?", (ad["id"],))
     user_id = ad["user_id"]
-    movie_id = ad["movie_id"]
-    if not ad_required_for_movie(user_id, movie_id):
-        movie = execute("SELECT * FROM movies WHERE id=?", (movie_id,), fetchone=True)
+    user = get_user(user_id)
+    if not user or not user["pending_ads_required"]:
+        return True  # g‘ayritabiiy holat
+
+    new_completed = (user["pending_ads_completed"] or 0) + 1
+    execute("UPDATE users SET pending_ads_completed=? WHERE user_id=?", (new_completed, user_id))
+
+    if new_completed >= user["pending_ads_required"]:
+        # barcha reklamalar bajarildi – kinoni yuboramiz
+        movie = execute("SELECT * FROM movies WHERE id=?", (user["pending_movie_id"],), fetchone=True)
         if movie:
             try:
                 send_movie_to_user(user_id, user_id, movie)
             except Exception:
                 logging.exception("Kino yuborishda xato")
+        # holatni tozalash
+        execute("""
+            UPDATE users SET
+                pending_ads_required=0,
+                pending_ads_completed=0,
+                pending_movie_id=NULL
+            WHERE user_id=?
+        """, (user_id,))
     return True
 
-# =========================================================
-# FLASK ILOVA (Webhook va postback uchun)
-# =========================================================
-
-app = Flask(__name__)
-
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN.split(':', 1)[0]}"
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-# =========================================================
-# KLAVIATURALAR VA KINONI YUBORISH
-# =========================================================
-
-def main_keyboard(user_id: int):
-    keyboard = types.ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        row_width=2,
-    )
-    keyboard.add(
-        types.KeyboardButton("🔎 Kino kodi"),
-        types.KeyboardButton("🔥 Eng mashhur kinolar"),
-    )
-    keyboard.add(
-        types.KeyboardButton("📊 Statistika"),
-        types.KeyboardButton("💬 Adminga xabar"),
-    )
-    keyboard.add(
-        types.KeyboardButton("👤 Profil"),
-    )
-    if is_admin(user_id):
-        keyboard.add(types.KeyboardButton("🛠 Admin panel"))
-    return keyboard
-
-def admin_keyboard():
-    keyboard = types.ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        row_width=2,
-    )
-    keyboard.add(
-        types.KeyboardButton("🎬 Kinolar"),
-        types.KeyboardButton("⚙️ Reklama sozlamalari"),
-    )
-    keyboard.add(
-        types.KeyboardButton("👥 Foydalanuvchilar"),
-        types.KeyboardButton("📢 Reklama yuborish"),
-    )
-    keyboard.add(
-        types.KeyboardButton("📊 Statistika"),
-        types.KeyboardButton("🏠 Asosiy menyu"),
-    )
-    return keyboard
-
-def movies_keyboard():
-    keyboard = types.ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        row_width=2,
-    )
-    keyboard.add(
-        types.KeyboardButton("➕ Kino qo‘shish"),
-        types.KeyboardButton("🗑 Kino o‘chirish"),
-    )
-    keyboard.add(
-        types.KeyboardButton("📋 Barcha kinolar"),
-        types.KeyboardButton("🔙 Admin panelga qaytish"),
-    )
-    return keyboard
-
+# ========== KINO YUBORISH ==========
 def send_movie_to_user(chat_id: int, user_id: int, movie):
+    """Kinoni foydalanuvchiga yuboradi va bepul kinolar hisobini oshiradi."""
     new_views = movie["views"] + 1
-    execute(
-        "UPDATE movies SET views=? WHERE id=?",
-        (new_views, movie["id"]),
-    )
-    execute(
-        "INSERT INTO watch_log(user_id, movie_id, watched_at) VALUES(?, ?, ?)",
-        (user_id, movie["id"], now_text()),
-    )
+    execute("UPDATE movies SET views=? WHERE id=?", (new_views, movie["id"]))
+    execute("INSERT INTO watch_log(user_id, movie_id, watched_at) VALUES(?,?,?)",
+            (user_id, movie["id"], now_text()))
+
+    # bepul kinolar sonini oshirish (faqat reklamasiz yuborilganda)
+    user = get_user(user_id)
+    if not user["pending_ads_required"]:  # reklama talab qilinmagan holat
+        execute("UPDATE users SET free_movies_count = free_movies_count + 1 WHERE user_id=?",
+                (user_id,))
 
     caption = (
         f"{movie['caption']}\n\n"
         f"🔢 Kod: <code>{safe(movie['code'])}</code>\n"
         f"👁 Ko‘rilgan: <b>{new_views}</b> marta"
     )
-
     if movie["file_type"] == "video":
-        bot.send_video(
-            chat_id,
-            movie["file_id"],
-            caption=caption,
-            supports_streaming=True,
-        )
+        bot.send_video(chat_id, movie["file_id"], caption=caption, supports_streaming=True)
     else:
-        bot.send_document(
-            chat_id,
-            movie["file_id"],
-            caption=caption,
-        )
+        bot.send_document(chat_id, movie["file_id"], caption=caption)
 
-def ensure_not_blocked(message):
-    register_user(message.from_user)
-    user = get_user(message.from_user.id)
-    if user and user["is_blocked"]:
-        bot.send_message(message.chat.id, "🚫 Siz botdan bloklangansiz.")
-        return False
-    return True
-
-# =========================================================
-# START VA ASOSIY MENYU
-# =========================================================
-
-@bot.message_handler(commands=["start"])
-def start_handler(message):
-    if not ensure_not_blocked(message):
-        return
-    clear_state(message.from_user.id)
-    open_main_menu(message.chat.id, message.from_user.id)
-
-def open_main_menu(chat_id: int, user_id: int):
-    bot.send_message(
-        chat_id,
-        "🎬 <b>Kino botga xush kelibsiz!</b>\n\n"
-        "Kinoni ko‘rish uchun reklama tomosha qilishingiz kerak bo‘ladi.\n"
-        "Quyidagi menyudan foydalaning:",
-        reply_markup=main_keyboard(user_id),
-    )
-
-@bot.message_handler(commands=["admin"])
-def admin_command(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "❌ Siz admin emassiz.")
-        return
-    clear_state(message.from_user.id)
-    bot.send_message(
-        message.chat.id,
-        "🛠 <b>Admin panel</b>",
-        reply_markup=admin_keyboard(),
-    )
-
-@bot.message_handler(func=lambda m: m.text == "🏠 Asosiy menyu")
-def home_handler(message):
-    if not ensure_not_blocked(message):
-        return
-    clear_state(message.from_user.id)
-    open_main_menu(message.chat.id, message.from_user.id)
-
-@bot.message_handler(func=lambda m: m.text == "🛠 Admin panel")
-def admin_panel_button(message):
-    if not is_admin(message.from_user.id):
-        return
-    clear_state(message.from_user.id)
-    bot.send_message(
-        message.chat.id,
-        "🛠 <b>Admin panel</b>",
-        reply_markup=admin_keyboard(),
-    )
-
-# =========================================================
-# KINO QIDIRISH VA REYTING
-# =========================================================
-
+# ========== KINO QIDIRISH, MASHHURLAR, STATISTIKA, PROFIL ==========
 @bot.message_handler(func=lambda m: m.text == "🔎 Kino kodi")
 def ask_movie_code(message):
-    if not ensure_not_blocked(message):
-        return
+    if not ensure_access(message): return
     set_state(message.from_user.id, "waiting_movie_code")
-    bot.send_message(
-        message.chat.id,
-        "🔢 <b>Kino kodini yuboring:</b>\nMasalan: <code>145</code>",
-    )
+    bot.send_message(message.chat.id, "🔢 <b>Kino kodini yuboring:</b>\nMasalan: <code>145</code>")
 
 @bot.message_handler(func=lambda m: m.text == "🔥 Eng mashhur kinolar")
 def popular_movies(message):
-    if not ensure_not_blocked(message):
-        return
-    movies = execute("""
-        SELECT code, title, views
-        FROM movies
-        ORDER BY views DESC, id DESC
-        LIMIT 10
-    """, fetchall=True)
-
+    if not ensure_access(message): return
+    movies = execute("SELECT code, title, views FROM movies ORDER BY views DESC, id DESC LIMIT 10", fetchall=True)
     if not movies:
         bot.send_message(message.chat.id, "Hozircha kinolar mavjud emas.")
         return
-
-    medals = ["🥇", "🥈", "🥉"]
+    medals = ["🥇","🥈","🥉"]
     lines = ["🔥 <b>ENG MASHHUR KINOLAR</b>\n"]
     for i, m in enumerate(movies):
-        icon = medals[i] if i < 3 else f"{i+1}."
-        lines.append(
-            f"{icon} <b>{safe(m['title'])}</b>\n"
-            f"   Kod: <code>{safe(m['code'])}</code> | 👁 {m['views']}"
-        )
+        icon = medals[i] if i<3 else f"{i+1}."
+        lines.append(f"{icon} <b>{safe(m['title'])}</b>\n   Kod: <code>{safe(m['code'])}</code> | 👁 {m['views']}")
     bot.send_message(message.chat.id, "\n\n".join(lines))
-
-# =========================================================
-# STATISTIKA VA PROFIL
-# =========================================================
 
 @bot.message_handler(func=lambda m: m.text == "📊 Statistika")
 def public_statistics(message):
-    if not ensure_not_blocked(message):
-        return
+    if not ensure_access(message): return
     users = execute("SELECT COUNT(*) AS c FROM users", fetchone=True)["c"]
     movies = execute("SELECT COUNT(*) AS c FROM movies", fetchone=True)["c"]
     views = execute("SELECT COALESCE(SUM(views),0) AS c FROM movies", fetchone=True)["c"]
-
-    bot.send_message(
-        message.chat.id,
-        "📊 <b>BOT STATISTIKASI</b>\n\n"
-        f"🎬 Kinolar: <b>{movies}</b>\n"
-        f"👁 Jami ko‘rishlar: <b>{views}</b>\n"
-        f"👥 Foydalanuvchilar: <b>{users}</b>",
-    )
+    bot.send_message(message.chat.id, f"📊 <b>BOT STATISTIKASI</b>\n\n🎬 Kinolar: <b>{movies}</b>\n👁 Ko‘rishlar: <b>{views}</b>\n👥 Foydalanuvchilar: <b>{users}</b>")
 
 @bot.message_handler(func=lambda m: m.text == "👤 Profil")
 def profile_handler(message):
+    if not ensure_access(message): return
     register_user(message.from_user)
     user = get_user(message.from_user.id)
-    watched = execute(
-        "SELECT COUNT(*) AS c FROM watch_log WHERE user_id=?",
-        (message.from_user.id,),
-        fetchone=True,
-    )["c"]
-
-    bot.send_message(
-        message.chat.id,
-        "👤 <b>PROFIL</b>\n\n"
+    watched = execute("SELECT COUNT(*) AS c FROM watch_log WHERE user_id=?",(message.from_user.id,), fetchone=True)["c"]
+    bot.send_message(message.chat.id,
+        f"👤 <b>PROFIL</b>\n\n"
         f"Ism: <b>{safe(user['full_name'])}</b>\n"
         f"🆔 ID: <code>{user['user_id']}</code>\n"
         f"🔗 Username: {safe(user['username'] or 'Yo‘q')}\n"
         f"🎬 Ko‘rilgan kinolar: <b>{watched}</b>\n"
-        f"📆 Qo‘shilgan: <b>{safe(user['joined_at'])}</b>",
-    )
+        f"📆 Qo‘shilgan: <b>{safe(user['joined_at'])}</b>")
 
-# =========================================================
-# USERDAN ADMINGA XABAR
-# =========================================================
-
+# ========== ADMINGA XABAR ==========
 @bot.message_handler(func=lambda m: m.text == "💬 Adminga xabar")
-def ask_admin_message(message):
-    if not ensure_not_blocked(message):
-        return
+def ask_admin_msg(message):
+    if not ensure_access(message): return
     set_state(message.from_user.id, "waiting_admin_message")
     bot.send_message(message.chat.id, "💬 Adminga yuboriladigan xabarni yozing:")
 
-# =========================================================
-# ADMIN: KINOLAR BO‘LIMI
-# =========================================================
-
+# ========== ADMIN: KINOLAR BO‘LIMI ==========
 @bot.message_handler(func=lambda m: m.text == "🎬 Kinolar")
 def movies_section(message):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     clear_state(message.from_user.id)
     bot.send_message(message.chat.id, "🎬 Kinolar bo‘limi", reply_markup=movies_keyboard())
 
 @bot.message_handler(func=lambda m: m.text == "➕ Kino qo‘shish")
 def add_movie_start(message):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     set_state(message.from_user.id, "add_movie_video")
-    bot.send_message(
-        message.chat.id,
-        "🎥 Kino videosini (yoki hujjat) yuboring:",
-    )
+    bot.send_message(message.chat.id, "🎥 Kino videosini (yoki hujjat) yuboring:")
 
 @bot.message_handler(func=lambda m: m.text == "🗑 Kino o‘chirish")
 def delete_movie_start(message):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     set_state(message.from_user.id, "delete_movie_code")
     bot.send_message(message.chat.id, "🗑 O‘chiriladigan kino kodini yuboring:")
 
 @bot.message_handler(func=lambda m: m.text == "📋 Barcha kinolar")
 def all_movies_handler(message):
-    if not is_admin(message.from_user.id):
-        return
-    movies = execute("""
-        SELECT code, title, views FROM movies ORDER BY id DESC LIMIT 100
-    """, fetchall=True)
+    if not is_admin(message.from_user.id): return
+    movies = execute("SELECT code, title, views FROM movies ORDER BY id DESC LIMIT 100", fetchall=True)
     if not movies:
         bot.send_message(message.chat.id, "Kinolar mavjud emas.")
         return
     text = ["📋 <b>BARCHA KINOLAR</b>\n"]
     for i, m in enumerate(movies, 1):
-        text.append(
-            f"{i}. <b>{safe(m['title'])}</b>\n"
-            f"   Kod: <code>{safe(m['code'])}</code> | 👁 {m['views']}"
-        )
+        text.append(f"{i}. <b>{safe(m['title'])}</b>\n   Kod: <code>{safe(m['code'])}</code> | 👁 {m['views']}")
     full = "\n\n".join(text)
     for start in range(0, len(full), 3900):
         bot.send_message(message.chat.id, full[start:start+3900])
 
 @bot.message_handler(func=lambda m: m.text == "🔙 Admin panelga qaytish")
 def back_to_admin_panel(message):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     clear_state(message.from_user.id)
-    bot.send_message(
-        message.chat.id,
-        "🛠 <b>Admin panel</b>",
-        reply_markup=admin_keyboard(),
-    )
+    bot.send_message(message.chat.id, "🛠 <b>Admin panel</b>", reply_markup=admin_keyboard())
 
-# =========================================================
-# ADMIN: REKLAMA SOZLAMALARI
-# =========================================================
+# ========== ADMIN: KANALLAR ==========
+@bot.message_handler(func=lambda m: m.text == "📡 Kanallar")
+def channels_admin(message):
+    if not is_admin(message.from_user.id): return
+    channels = get_channels()
+    lines = ["📡 <b>MAJBURIY OBUNA KANALLARI</b>\n"]
+    if channels:
+        for ch in channels:
+            ch_type = "🔒 Maxfiy" if ch["username"] and ch["username"].startswith("private_") else "📢 Ochiq"
+            lines.append(f"ID: <code>{ch['id']}</code> | {ch_type}: <b>{safe(ch['title'])}</b> | {safe(ch['username'])}")
+    else:
+        lines.append("Hozircha kanal qo‘shilmagan.")
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(types.InlineKeyboardButton("➕ Kanal qo‘shish", callback_data="channel_add"),
+           types.InlineKeyboardButton("🗑 Kanal o‘chirish", callback_data="channel_delete"))
+    bot.send_message(message.chat.id, "\n\n".join(lines), reply_markup=kb)
 
+@bot.callback_query_handler(func=lambda c: c.data == "channel_add")
+def channel_add_callback(call):
+    if not is_admin(call.from_user.id): return
+    set_state(call.from_user.id, "channel_add_username")
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "➕ Kanal username yoki link yuboring:\nMasalan: @kanal yoki https://t.me/kanal")
+
+@bot.callback_query_handler(func=lambda c: c.data == "channel_delete")
+def channel_delete_callback(call):
+    if not is_admin(call.from_user.id): return
+    set_state(call.from_user.id, "channel_delete_value")
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "🗑 O‘chiriladigan kanalning ID raqamini yoki username/linkini yuboring:")
+
+# ========== ADMIN: REKLAMA SOZLAMALARI ==========
 @bot.message_handler(func=lambda m: m.text == "⚙️ Reklama sozlamalari")
-def ad_settings_handler(message):
-    if not is_admin(message.from_user.id):
-        return
-    template = get_setting("richads_link_template")
-    campaign = get_setting("richads_campaign_id")
-    required = get_setting("required_ads")
-    floor = get_setting("richads_min_floor")
-    lang = get_setting("richads_lang")
-
+def ad_settings(message):
+    if not is_admin(message.from_user.id): return
     text = (
         "⚙️ <b>REKLAMA SOZLAMALARI</b>\n\n"
-        f"Kampaniya ID: <code>{safe(campaign)}</code>\n"
-        f"Link shabloni: <code>{safe(template)}</code>\n"
-        f"Har kino uchun reklama soni: <b>{required}</b>\n"
-        f"Minimal floor: {floor}\n"
-        f"Til: {lang}"
+        f"Kampaniya ID: <code>{safe(get_setting('richads_campaign_id'))}</code>\n"
+        f"Link shabloni: <code>{safe(get_setting('richads_link_template'))}</code>\n"
+        f"Bepul kinolar soni: <b>{get_setting('free_movies_limit')}</b>\n"
+        f"Reklama soni (limitdan keyin): <b>{get_setting('ads_after_limit')}</b>\n"
+        f"Minimal floor: {get_setting('richads_min_floor')}\n"
+        f"Til: {get_setting('richads_lang')}"
     )
-    keyboard = types.InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        types.InlineKeyboardButton("Kampaniya ID o‘zgartirish", callback_data="ad_campaign_id"),
-        types.InlineKeyboardButton("Link shablonini o‘zgartirish", callback_data="ad_link_template"),
-        types.InlineKeyboardButton("Reklama sonini o‘zgartirish", callback_data="ad_required"),
-        types.InlineKeyboardButton("Minimal floor o‘zgartirish", callback_data="ad_floor"),
-        types.InlineKeyboardButton("Tilni o‘zgartirish", callback_data="ad_lang"),
-    )
-    bot.send_message(message.chat.id, text, reply_markup=keyboard)
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("Kampaniya ID", callback_data="ad_campaign_id"),
+           types.InlineKeyboardButton("Link shabloni", callback_data="ad_link_template"),
+           types.InlineKeyboardButton("Bepul kino soni", callback_data="ad_free_limit"),
+           types.InlineKeyboardButton("Reklama soni", callback_data="ad_ads_count"),
+           types.InlineKeyboardButton("Minimal floor", callback_data="ad_floor"),
+           types.InlineKeyboardButton("Til", callback_data="ad_lang"))
+    bot.send_message(message.chat.id, text, reply_markup=kb)
 
-@bot.callback_query_handler(func=lambda call: call.data in [
-    "ad_campaign_id", "ad_link_template", "ad_required", "ad_floor", "ad_lang"
-])
-def ad_settings_callback(call):
-    if not is_admin(call.from_user.id):
-        return bot.answer_callback_query(call.id, "Ruxsat yo‘q")
+@bot.callback_query_handler(func=lambda c: c.data in [
+    "ad_campaign_id","ad_link_template","ad_free_limit","ad_ads_count","ad_floor","ad_lang"])
+def ad_callback(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Ruxsat yo‘q")
     mapping = {
         "ad_campaign_id": ("change_ad_campaign_id", "RichAds kampaniya ID sini yuboring:"),
-        "ad_link_template": ("change_ad_link_template", "Yangi link shablonini yuboring. {campaign_id} va {sub_id} o‘zgaruvchilarni saqlang:"),
-        "ad_required": ("change_ad_required", "Bitta kino uchun nechta reklama kerak? (son):"),
-        "ad_floor": ("change_ad_floor", "Minimal floor qiymatini yuboring (masalan, 0.01):"),
-        "ad_lang": ("change_ad_lang", "Til kodini yuboring (masalan, uz, ru, en):"),
+        "ad_link_template": ("change_ad_link_template", "Yangi link shablonini yuboring ({campaign_id} va {sub_id} saqlansin):"),
+        "ad_free_limit": ("change_ad_free_limit", "Bepul kinolar sonini kiriting (masalan 3):"),
+        "ad_ads_count": ("change_ad_ads_count", "Limitdan keyin nechta reklama ko‘rilsin? (son):"),
+        "ad_floor": ("change_ad_floor", "Minimal floor qiymatini yuboring (masalan 0.01):"),
+        "ad_lang": ("change_ad_lang", "Til kodini yuboring (uz, ru, en...):"),
     }
-    state, text = mapping[call.data]
+    state, msg = mapping[call.data]
     set_state(call.from_user.id, state)
     bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, text)
+    bot.send_message(call.message.chat.id, msg)
 
-# =========================================================
-# ADMIN: FOYDALANUVCHILAR
-# =========================================================
-
+# ========== ADMIN: FOYDALANUVCHILAR ==========
 @bot.message_handler(func=lambda m: m.text == "👥 Foydalanuvchilar")
 def user_manage_start(message):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     set_state(message.from_user.id, "manage_user_id")
-    bot.send_message(message.chat.id, "Boshqariladigan foydalanuvchi ID sini yuboring:")
+    bot.send_message(message.chat.id, "Boshqariladigan foydalanuvchi Telegram ID sini yuboring:")
 
-def user_manage_keyboard(user_id: int):
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        types.InlineKeyboardButton("🚫 Bloklash", callback_data=f"user_block:{user_id}"),
-        types.InlineKeyboardButton("✅ Blokdan chiqarish", callback_data=f"user_unblock:{user_id}"),
-    )
-    keyboard.add(
-        types.InlineKeyboardButton("💬 Xabar yuborish", callback_data=f"reply_user:{user_id}"),
-    )
-    return keyboard
+def user_manage_keyboard(user_id):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(types.InlineKeyboardButton("🚫 Bloklash", callback_data=f"user_block:{user_id}"),
+           types.InlineKeyboardButton("✅ Blokdan chiqarish", callback_data=f"user_unblock:{user_id}"))
+    kb.add(types.InlineKeyboardButton("💬 Xabar yuborish", callback_data=f"reply_user:{user_id}"))
+    return kb
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("user_block:"))
-def user_block_callback(call):
-    if not is_admin(call.from_user.id):
-        return
-    user_id = int(call.data.split(":", 1)[1])
-    execute("UPDATE users SET is_blocked=1 WHERE user_id=?", (user_id,))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("user_block:"))
+def block_user(call):
+    if not is_admin(call.from_user.id): return
+    uid = int(call.data.split(":",1)[1])
+    execute("UPDATE users SET is_blocked=1 WHERE user_id=?", (uid,))
     bot.answer_callback_query(call.id, "Bloklandi.")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("user_unblock:"))
-def user_unblock_callback(call):
-    if not is_admin(call.from_user.id):
-        return
-    user_id = int(call.data.split(":", 1)[1])
-    execute("UPDATE users SET is_blocked=0 WHERE user_id=?", (user_id,))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("user_unblock:"))
+def unblock_user(call):
+    if not is_admin(call.from_user.id): return
+    uid = int(call.data.split(":",1)[1])
+    execute("UPDATE users SET is_blocked=0 WHERE user_id=?", (uid,))
     bot.answer_callback_query(call.id, "Blokdan chiqarildi.")
 
-# =========================================================
-# ADMIN: REKLAMA YUBORISH
-# =========================================================
-
+# ========== ADMIN: REKLAMA YUBORISH ==========
 @bot.message_handler(func=lambda m: m.text == "📢 Reklama yuborish")
 def broadcast_start(message):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     set_state(message.from_user.id, "broadcast_content")
-    bot.send_message(message.chat.id, "Yuboriladigan kontentni yuboring (matn, rasm, video...)")
+    bot.send_message(message.chat.id, "Yuboriladigan kontentni yuboring (matn, rasm, video...).")
 
-def broadcast_copy(admin_chat_id: int, source_message_id: int):
+def broadcast_copy(admin_chat_id, source_msg_id):
     users = execute("SELECT user_id FROM users WHERE is_blocked=0", fetchall=True)
-    success = 0
-    failed = 0
-    status_msg = bot.send_message(admin_chat_id, f"📤 Yuborish boshlandi. Jami: {len(users)}")
+    success, failed = 0, 0
+    st = bot.send_message(admin_chat_id, f"📤 Yuborish boshlandi. Jami: {len(users)}")
     for i, row in enumerate(users, 1):
         try:
-            bot.copy_message(row["user_id"], admin_chat_id, source_message_id)
+            bot.copy_message(row["user_id"], admin_chat_id, source_msg_id)
             success += 1
-        except Exception:
+        except:
             failed += 1
-        time.sleep(0.05)
         if i % 100 == 0:
-            try:
-                bot.edit_message_text(
-                    f"📤 Jarayon: {i}/{len(users)}\n✅ {success} | ❌ {failed}",
-                    admin_chat_id,
-                    status_msg.message_id,
-                )
-            except:
-                pass
-    bot.edit_message_text(
-        f"📊 <b>REKLAMA NATIJASI</b>\n\n✅ Yuborildi: <b>{success}</b>\n❌ Yuborilmadi: <b>{failed}</b>",
-        admin_chat_id,
-        status_msg.message_id,
-    )
+            try: bot.edit_message_text(f"📤 {i}/{len(users)}\n✅ {success} | ❌ {failed}", admin_chat_id, st.message_id)
+            except: pass
+    bot.edit_message_text(f"📊 <b>REKLAMA NATIJASI</b>\n\n✅ Yuborildi: <b>{success}</b>\n❌ Yuborilmadi: <b>{failed}</b>", admin_chat_id, st.message_id)
 
-@bot.message_handler(content_types=["text", "photo", "video", "document", "animation"],
+@bot.message_handler(content_types=["text","photo","video","document","animation"],
                      func=lambda m: is_admin(m.from_user.id) and get_state(m.from_user.id)[0] == "broadcast_content")
 def broadcast_content_handler(message):
     clear_state(message.from_user.id)
-    bot.send_message(message.chat.id, "📢 Reklama qabul qilindi. Yuborilmoqda...")
-    broadcast_copy(message.chat.id, message.message_id)
+    bot.send_message(message.chat.id, "📢 Reklama yuborilmoqda...")
+    threading.Thread(target=broadcast_copy, args=(message.chat.id, message.message_id), daemon=True).start()
 
-# =========================================================
-# ADMIN: STATISTIKA
-# =========================================================
-
+# ========== ADMIN STATISTIKA ==========
 @bot.message_handler(func=lambda m: m.text == "📊 Statistika")
 def admin_statistics(message):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     users = execute("SELECT COUNT(*) AS c FROM users", fetchone=True)["c"]
     blocked = execute("SELECT COUNT(*) AS c FROM users WHERE is_blocked=1", fetchone=True)["c"]
     movies = execute("SELECT COUNT(*) AS c FROM movies", fetchone=True)["c"]
     views = execute("SELECT COALESCE(SUM(views),0) AS c FROM movies", fetchone=True)["c"]
     ad_views = execute("SELECT COUNT(*) AS c FROM ad_views WHERE status='completed'", fetchone=True)["c"]
-
-    bot.send_message(
-        message.chat.id,
-        "📊 <b>ADMIN STATISTIKA</b>\n\n"
+    bot.send_message(message.chat.id,
+        f"📊 <b>ADMIN STATISTIKA</b>\n\n"
         f"👥 Foydalanuvchilar: <b>{users}</b> (bloklangan: {blocked})\n"
         f"🎬 Kinolar: <b>{movies}</b>\n"
         f"👁 Ko‘rishlar: <b>{views}</b>\n"
-        f"📣 Reklama tomoshalari: <b>{ad_views}</b>",
-    )
+        f"📣 Reklama tomoshalari: <b>{ad_views}</b>")
 
-# =========================================================
-# UNIVERSAL MATN HANDLER — HOLATLAR
-# =========================================================
-
+# ========== UNIVERSAL MATN HANDLER ==========
 @bot.message_handler(commands=["cancel"])
 def cancel_handler(message):
     clear_state(message.from_user.id)
-    keyboard = admin_keyboard() if is_admin(message.from_user.id) else main_keyboard(message.from_user.id)
-    bot.send_message(message.chat.id, "❌ Amal bekor qilindi.", reply_markup=keyboard)
+    kb = admin_keyboard() if is_admin(message.from_user.id) else main_keyboard(message.from_user.id)
+    bot.send_message(message.chat.id, "❌ Amal bekor qilindi.", reply_markup=kb)
 
 @bot.message_handler(content_types=["text"])
 def text_state_handler(message):
     register_user(message.from_user)
     user_id = message.from_user.id
-    text = (message.text or "").strip()
+    text = message.text.strip()
     state, data = get_state(user_id)
 
     if not state:
         if not is_admin(user_id):
-            bot.send_message(
-                message.chat.id,
-                "Menyudan kerakli bo‘limni tanlang.",
-                reply_markup=main_keyboard(user_id),
-            )
+            bot.send_message(message.chat.id, "Menyudan kerakli bo‘limni tanlang.", reply_markup=main_keyboard(user_id))
         else:
-            bot.send_message(
-                message.chat.id,
-                "Admin panel yoki menyudan foydalaning.",
-                reply_markup=admin_keyboard() if is_admin(user_id) else main_keyboard(user_id),
-            )
+            bot.send_message(message.chat.id, "Admin panel yoki menyudan foydalaning.", reply_markup=admin_keyboard())
         return
 
-    # --- KINO KODI ---
+    # --- KINO KODI SO‘RALGAN ---
     if state == "waiting_movie_code":
         code = text
         movie = execute("SELECT * FROM movies WHERE code=?", (code,), fetchone=True)
-        execute(
-            "INSERT INTO search_log(user_id, code, found, searched_at) VALUES(?,?,?,?)",
-            (user_id, code, 1 if movie else 0, now_text()),
-        )
+        execute("INSERT INTO search_log(user_id, code, found, searched_at) VALUES(?,?,?,?)",
+                (user_id, code, 1 if movie else 0, now_text()))
         clear_state(user_id)
-
         if not movie:
-            bot.send_message(
-                message.chat.id,
-                "❌ Bunday kodli kino topilmadi.",
-                reply_markup=main_keyboard(user_id),
-            )
+            bot.send_message(message.chat.id, "❌ Bunday kodli kino topilmadi.", reply_markup=main_keyboard(user_id))
             return
 
-        # Reklama kerakmi?
-        if ad_required_for_movie(user_id, movie["id"]):
-            send_ad_and_track(user_id, message.chat.id, movie["id"])
-        else:
+        user = get_user(user_id)
+        free_limit = int(get_setting("free_movies_limit"))
+        free_count = user["free_movies_count"] or 0
+
+        # Agar bepul kinolar limiti yetarli bo‘lsa, reklamasiz yuboramiz
+        if free_count < free_limit:
             send_movie_to_user(message.chat.id, user_id, movie)
+        else:
+            # Reklama talab qilinadi
+            ads_needed = int(get_setting("ads_after_limit"))
+            # foydalanuvchining kutilayotgan reklama holatini o‘rnatish
+            execute("""
+                UPDATE users SET
+                    pending_ads_required=?,
+                    pending_ads_completed=0,
+                    pending_movie_id=?
+                WHERE user_id=?
+            """, (ads_needed, movie["id"], user_id))
+            send_ad_and_track(user_id, message.chat.id)
         return
 
     # --- ADMINGA XABAR ---
     if state == "waiting_admin_message":
-        msg_id = execute(
-            "INSERT INTO messages(user_id, message_text, created_at) VALUES(?,?,?)",
-            (user_id, text, now_text()),
-        )
+        msg_id = execute("INSERT INTO messages(user_id, message_text, created_at) VALUES(?,?,?)",
+                         (user_id, text, now_text()))
         clear_state(user_id)
         bot.send_message(message.chat.id, "✅ Xabaringiz adminga yuborildi.", reply_markup=main_keyboard(user_id))
-
         user = get_user(user_id)
-        for admin_id in ADMIN_IDS:
+        for aid in ADMIN_IDS:
             try:
-                bot.send_message(
-                    admin_id,
+                bot.send_message(aid,
                     f"📩 <b>Yangi xabar #{msg_id}</b>\n\n"
                     f"👤 {safe(user['full_name'])} (<code>{user_id}</code>)\n"
                     f"💬 {safe(text)}",
                     reply_markup=types.InlineKeyboardMarkup().add(
-                        types.InlineKeyboardButton("✍️ Javob yozish", callback_data=f"reply_user:{user_id}")
-                    ),
-                )
-            except:
-                pass
+                        types.InlineKeyboardButton("✍️ Javob yozish", callback_data=f"reply_user:{user_id}")))
+            except: pass
         return
 
     # --- ADMIN: KINO QO‘SHISH (caption) ---
     if state == "add_movie_caption" and is_admin(user_id):
-        parts = data.split("|", 2)
-        if len(parts) != 3:
+        parts = data.split("|", 1)   # file_type|file_id
+        if len(parts) != 2:
             clear_state(user_id)
+            bot.send_message(message.chat.id, "❌ Ma'lumot buzilgan. Qaytadan urinib ko'ring.")
             return
-        file_type, file_id, _ = parts
+        file_type, file_id = parts
         title = text.splitlines()[0].strip()
         title = re.sub(r"^[🎬\s]+", "", title).strip() or "Nomsiz kino"
         set_state(user_id, "add_movie_code", f"{file_type}|{file_id}|{title}|{text}")
@@ -888,19 +669,17 @@ def text_state_handler(message):
         if len(code) > 30:
             bot.send_message(message.chat.id, "❌ Kod juda uzun.")
             return
-        existing = execute("SELECT title FROM movies WHERE code=?", (code,), fetchone=True)
-        if existing:
-            bot.send_message(message.chat.id, f"❌ Bu kod band. Kino: <b>{safe(existing['title'])}</b>")
+        if execute("SELECT id FROM movies WHERE code=?", (code,), fetchone=True):
+            bot.send_message(message.chat.id, "❌ Bu kod band. Boshqa kod yuboring.")
             return
-        parts = data.split("|", 3)
+        parts = data.split("|", 3)   # file_type|file_id|title|caption
         if len(parts) != 4:
             clear_state(user_id)
+            bot.send_message(message.chat.id, "❌ Ma'lumot buzilgan.")
             return
         file_type, file_id, title, caption = parts
-        execute(
-            "INSERT INTO movies(code, title, caption, file_id, file_type, created_at, added_by) VALUES(?,?,?,?,?,?,?)",
-            (code, title, caption, file_id, file_type, now_text(), user_id),
-        )
+        execute("INSERT INTO movies(code,title,caption,file_id,file_type,created_at,added_by) VALUES(?,?,?,?,?,?,?)",
+                (code, title, caption, file_id, file_type, now_text(), user_id))
         clear_state(user_id)
         bot.send_message(message.chat.id, f"✅ <b>{safe(title)}</b> qo‘shildi. Kod: <code>{safe(code)}</code>",
                          reply_markup=admin_keyboard())
@@ -914,22 +693,82 @@ def text_state_handler(message):
             bot.send_message(message.chat.id, "❌ Bunday kodli kino topilmadi.", reply_markup=admin_keyboard())
             return
         execute("DELETE FROM movies WHERE id=?", (movie["id"],))
+        execute("DELETE FROM watch_log WHERE movie_id=?", (movie["id"],))
         bot.send_message(message.chat.id, f"✅ <b>{safe(movie['title'])}</b> o‘chirildi.", reply_markup=admin_keyboard())
         return
 
-    # --- ADMIN: REKLAMA SOZLAMALARI ---
+    # --- ADMIN: KANAL QO‘SHISH (username) ---
+    if state == "channel_add_username" and is_admin(user_id):
+        username = text.strip()
+        if not (username.startswith("@") or username.startswith("https://")):
+            username = normalize_channel_username(username)
+        # Kanal mavjudligini tekshirish
+        try:
+            chat = bot.get_chat(username)
+            chat_id = chat.id
+            title = chat.title or username
+            invite_link = f"https://t.me/{username.lstrip('@')}" if username.startswith("@") else username
+        except:
+            bot.send_message(message.chat.id, "❌ Kanal topilmadi yoki bot admin emas.")
+            return
+        set_state(user_id, "channel_add_link", f"{username}|{title}|{chat_id}")
+        bot.send_message(message.chat.id, f"📢 Kanal topildi: <b>{safe(title)}</b>\n\nKanalga havolani yuboring (https://t.me/...):")
+        return
+
+    if state == "channel_add_link" and is_admin(user_id):
+        parts = data.split("|", 2)   # username|title|chat_id
+        if len(parts) != 3:
+            clear_state(user_id)
+            return
+        username, title, chat_id = parts
+        invite_link = text.strip()
+        if not invite_link.startswith("http"):
+            bot.send_message(message.chat.id, "❌ To‘g‘ri havola yuboring.")
+            return
+        # mavjudlikni tekshirish
+        if execute("SELECT id FROM channels WHERE username=?", (username,), fetchone=True):
+            bot.send_message(message.chat.id, "❌ Bu kanal allaqachon qo‘shilgan.")
+            clear_state(user_id)
+            return
+        execute("INSERT INTO channels(title, username, invite_link, chat_id) VALUES(?,?,?,?)",
+                (title, username, invite_link, int(chat_id)))
+        clear_state(user_id)
+        bot.send_message(message.chat.id, f"✅ <b>{safe(title)}</b> kanali majburiy obunaga qo‘shildi.",
+                         reply_markup=admin_keyboard())
+        return
+
+    # --- ADMIN: KANAL O‘CHIRISH ---
+    if state == "channel_delete_value" and is_admin(user_id):
+        val = text.strip()
+        # ID bo‘yicha qidirish
+        if val.isdigit():
+            channel = execute("SELECT * FROM channels WHERE id=?", (int(val),), fetchone=True)
+        else:
+            val = normalize_channel_username(val)
+            channel = execute("SELECT * FROM channels WHERE username=?", (val,), fetchone=True)
+        clear_state(user_id)
+        if not channel:
+            bot.send_message(message.chat.id, "❌ Bunday kanal topilmadi.", reply_markup=admin_keyboard())
+            return
+        execute("DELETE FROM channels WHERE id=?", (channel["id"],))
+        bot.send_message(message.chat.id, f"✅ <b>{safe(channel['title'])}</b> kanali ro‘yxatdan o‘chirildi.",
+                         reply_markup=admin_keyboard())
+        return
+
+    # --- ADMIN: REKLAMA SOZLAMALARI O‘ZGARTIRISH ---
     if state.startswith("change_ad_") and is_admin(user_id):
         key_map = {
             "change_ad_campaign_id": "richads_campaign_id",
             "change_ad_link_template": "richads_link_template",
-            "change_ad_required": "required_ads",
+            "change_ad_free_limit": "free_movies_limit",
+            "change_ad_ads_count": "ads_after_limit",
             "change_ad_floor": "richads_min_floor",
             "change_ad_lang": "richads_lang",
         }
         key = key_map.get(state)
-        if key == "required_ads":
-            if not text.isdigit() or int(text) < 1:
-                bot.send_message(message.chat.id, "❌ Iltimos, musbat son kiriting.")
+        if key in ("free_movies_limit", "ads_after_limit"):
+            if not text.isdigit() or int(text) < 0:
+                bot.send_message(message.chat.id, "❌ Musbat son kiriting.")
                 return
         set_setting(key, text)
         clear_state(user_id)
@@ -940,8 +779,8 @@ def text_state_handler(message):
     if state == "manage_user_id" and is_admin(user_id):
         try:
             target_id = int(text)
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ Faqat raqamli ID yuboring.")
+        except:
+            bot.send_message(message.chat.id, "❌ Raqamli ID yuboring.")
             return
         target = get_user(target_id)
         clear_state(user_id)
@@ -949,15 +788,14 @@ def text_state_handler(message):
             bot.send_message(message.chat.id, "❌ Foydalanuvchi topilmadi.")
             return
         status = "Bloklangan" if target["is_blocked"] else "Aktiv"
-        bot.send_message(
-            message.chat.id,
+        bot.send_message(message.chat.id,
             f"👤 <b>FOYDALANUVCHI</b>\n\n"
             f"Ism: {safe(target['full_name'])}\n"
             f"ID: <code>{target_id}</code>\n"
             f"Username: {safe(target['username'] or 'Yo‘q')}\n"
-            f"Holat: <b>{status}</b>",
-            reply_markup=user_manage_keyboard(target_id),
-        )
+            f"Holat: <b>{status}</b>\n"
+            f"Bepul kinolar: {target['free_movies_count']}",
+            reply_markup=user_manage_keyboard(target_id))
         return
 
     # --- ADMIN: USERGA JAVOB ---
@@ -975,12 +813,9 @@ def text_state_handler(message):
         clear_state(user_id)
         return
 
-    bot.send_message(message.chat.id, "❌ Noto‘g‘ri ma’lumot. Bekor qilish uchun /cancel")
+    bot.send_message(message.chat.id, "❌ Noto‘g‘ri ma’lumot. /cancel bilan bekor qiling.")
 
-# =========================================================
-# ADMIN: VIDEO/DOCUMENT QABUL QILISH
-# =========================================================
-
+# ========== ADMIN: VIDEO/DOCUMENT QABUL (kino qo‘shish) ==========
 @bot.message_handler(content_types=["video", "document"],
                      func=lambda m: is_admin(m.from_user.id) and get_state(m.from_user.id)[0] == "add_movie_video")
 def add_movie_video(message):
@@ -992,12 +827,15 @@ def add_movie_video(message):
         file_id = message.document.file_id
         file_type = "document"
     set_state(message.from_user.id, "add_movie_caption", f"{file_type}|{file_id}")
-    bot.send_message(message.chat.id,
-                     "📝 Kino captionini yuboring (birinchi qatorda nom bo‘lsin).")
+    bot.send_message(message.chat.id, "📝 Kino captionini yuboring (birinchi qatorda nom bo‘lsin).")
+# =========================================================
+# 3-QISM: Flask webhook, RichAds postback, ishga tushirish
+# =========================================================
 
-# =========================================================
-# FLASK: WEBHOOK VA RICHADS POSTBACK
-# =========================================================
+app = Flask(__name__)
+
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN.split(':', 1)[0]}"
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 @app.get("/")
 def health():
@@ -1035,17 +873,12 @@ def richads_callback():
     else:
         return jsonify({"status": "not_found_or_already_completed"}), 200
 
-# =========================================================
-# WEBHOOK SOZLASH VA ISHGA TUSHIRISH
-# =========================================================
-
 def configure_webhook():
+    """Render'da webhookni avtomatik o‘rnatish."""
     init_db()
 
     if not RENDER_EXTERNAL_URL:
-        logging.warning(
-            "RENDER_EXTERNAL_URL topilmadi. Render Web Service deploy bo‘lganda avtomatik beriladi."
-        )
+        logging.warning("RENDER_EXTERNAL_URL topilmadi. Webhook qo‘lda o‘rnatilishi kerak.")
         return
 
     webhook_url = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
@@ -1060,6 +893,7 @@ def configure_webhook():
                 "callback_query",
                 "my_chat_member",
                 "chat_member",
+                "chat_join_request",
             ],
             drop_pending_updates=True,
         )
@@ -1072,3 +906,5 @@ configure_webhook()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
+            
