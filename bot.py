@@ -1,4 +1,3 @@
-# bot.py (1/3)
 import html, logging, os, re, sqlite3, threading, time, uuid, requests
 from datetime import datetime
 import telebot
@@ -11,12 +10,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 DB_NAME = "kino_bot.db"
 
-# AdX1 sozlamalari
+# RichAds / AdX1 API sozlamalari
 AD_API_URL = os.getenv("AD_API_URL", "http://15068.xml.adx1.com/telegram-mb")
-PUBLISHER_ID = os.getenv("PUBLISHER_ID", "1018576")
+PUBLISHER_ID = os.getenv("PUBLISHER_ID", "792361")
 WIDGET_ID = os.getenv("WIDGET_ID", "351352")
 BID_FLOOR = float(os.getenv("BID_FLOOR", "0.0001"))
-PRODUCTION = os.getenv("PRODUCTION", "True").lower() == "true"
+PRODUCTION = os.getenv("PRODUCTION", "true").lower() == "true"
 
 if not BOT_TOKEN or ":" not in BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN noto‘g‘ri")
@@ -83,14 +82,15 @@ def init_db():
     )""")
     execute("""CREATE TABLE IF NOT EXISTS ad_views (
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
-        movie_id INTEGER, bid_id TEXT, status TEXT DEFAULT 'pending',
-        created_at TEXT, clicked_at TEXT
+        movie_id INTEGER, click_id TEXT UNIQUE, link_url TEXT,
+        status TEXT DEFAULT 'pending', created_at TEXT, clicked_at TEXT
     )""")
     execute("""CREATE TABLE IF NOT EXISTS join_requests (
         user_id INTEGER, chat_id INTEGER, request_date TEXT,
         PRIMARY KEY (user_id, chat_id)
     )""")
-    # Standart sozlamalar
+
+    # standart sozlamalar
     for k,v in [
         ("free_movies_limit", "3"),
         ("ads_after_limit", "2"),
@@ -130,7 +130,7 @@ def register_user(user):
             (user.id, name, uname, now_text(), now_text()))
 def get_user(uid): return execute("SELECT * FROM users WHERE user_id=?",(uid,), fetchone=True)
 
-# ========== MAJBURIY OBUNA (o‘zgartirishsiz) ==========
+# ========== MAJBURIY OBUNA ==========
 def get_channels():
     return execute("SELECT * FROM channels ORDER BY id", fetchall=True)
 
@@ -258,14 +258,11 @@ def admin_panel_btn(message):
     if not is_admin(message.from_user.id): return
     clear_state(message.from_user.id)
     bot.send_message(message.chat.id, "🛠 <b>Admin panel</b>", reply_markup=admin_keyboard())
-# =========================================================
-# 2-QISM: AdX1 reklama, kino qidirish, admin, holatlar
-# =========================================================
 
-# ---------- AdX1 REKLAMA FUNKSIYALARI ----------
+# ---------- RichAds REKLAMA FUNKSIYALARI ----------
 def fetch_ad_from_adx1(user_id):
-    """AdX1 API orqali reklama ma'lumotlarini oladi.
-    Qaytaradi: (image_url, link_url, bid_id) yoki None."""
+    """RichAds API orqali reklama oladi.
+    Qaytaradi: (image_url, caption, link_url, button_text, click_id) yoki None."""
     payload = {
         "language_code": "en",
         "publisher_id": get_setting("ad_publisher_id"),
@@ -277,56 +274,59 @@ def fetch_ad_from_adx1(user_id):
     try:
         resp = requests.post(AD_API_URL, json=payload, timeout=10)
         if resp.status_code != 200:
-            logging.error(f"AdX1 API xatosi: {resp.status_code}")
+            logging.error(f"Reklama API xatosi: {resp.status_code}")
             return None
         data = resp.json()
-        image_url = data.get("image_url")
-        link_url = data.get("link_url")
-        bid_id = data.get("bid_id")
-        if not image_url or not link_url or not bid_id:
+        if not isinstance(data, list) or len(data) == 0:
+            logging.error("Reklama ro‘yxati bo‘sh")
+            return None
+        ad = data[0]
+        image_url = ad.get("image")
+        caption = ad.get("message", "")
+        link_url = ad.get("link")
+        button_text = ad.get("button", "Batafsil")
+        if not image_url or not link_url:
             logging.error("Reklama ma'lumoti to‘liq emas")
             return None
-        return image_url, link_url, bid_id
+        click_id = str(uuid.uuid4())
+        return image_url, caption, link_url, button_text, click_id
     except Exception as e:
-        logging.exception("AdX1 so‘rovda xato")
+        logging.exception("Reklama so‘rovda xato")
         return None
 
 def send_ad_message(chat_id, user_id, movie_id):
-    """Foydalanuvchiga bitta reklama yuboradi (rasm + tugma)."""
+    """Foydalanuvchiga bitta reklama yuboradi (rasm + inline tugma)."""
     ad_data = fetch_ad_from_adx1(user_id)
     if not ad_data:
         bot.send_message(chat_id, "⚠️ Hozircha reklama topilmadi, keyinroq urinib ko‘ring.")
         return False
-    image_url, link_url, bid_id = ad_data
+    image_url, caption, link_url, button_text, click_id = ad_data
 
-    # Reklama yozuvini kiritamiz (link_url ham saqlanadi)
-    execute("ALTER TABLE ad_views ADD COLUMN link_url TEXT", ())
-
-    execute("INSERT INTO ad_views(user_id, movie_id, bid_id, link_url, status, created_at) VALUES(?,?,?,?,'pending',?)",
-            (user_id, movie_id, bid_id, link_url, now_text()))
+    # Reklama yozuvini kiritamiz
+    execute("INSERT INTO ad_views(user_id, movie_id, click_id, link_url, status, created_at) VALUES(?,?,?,?,'pending',?)",
+            (user_id, movie_id, click_id, link_url, now_text()))
 
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("📣 Reklamani ko‘rish", callback_data=f"ad_click:{bid_id}"))
+    kb.add(types.InlineKeyboardButton(f"📣 {button_text}", callback_data=f"ad_click:{click_id}"))
 
-    caption = "📺 Kinoni ochish uchun quyidagi reklamani ko‘ring va tugmani bosing."
+    caption = caption if caption else "📺 Kinoni ochish uchun reklamani ko‘ring va tugmani bosing."
     try:
         bot.send_photo(chat_id, image_url, caption=caption, reply_markup=kb)
         return True
     except Exception as e:
         logging.exception("Rasm yuborishda xato")
-        execute("DELETE FROM ad_views WHERE bid_id=?", (bid_id,))
+        execute("DELETE FROM ad_views WHERE click_id=?", (click_id,))
         return False
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("ad_click:"))
 def ad_click_handler(call):
     """Foydalanuvchi reklama tugmasini bosganda ishlaydi."""
-    bid_id = call.data.split(":", 1)[1]
-    ad = execute("SELECT * FROM ad_views WHERE bid_id=? AND status='pending'", (bid_id,), fetchone=True)
+    click_id = call.data.split(":", 1)[1]
+    ad = execute("SELECT * FROM ad_views WHERE click_id=? AND status='pending'", (click_id,), fetchone=True)
     if not ad:
         bot.answer_callback_query(call.id, "Bu reklama allaqachon ko‘rilgan.")
         return
 
-    # Reklama bosilganini belgilaymiz
     execute("UPDATE ad_views SET status='completed', clicked_at=? WHERE id=?", (now_text(), ad["id"]))
     user_id = call.from_user.id
     user = get_user(user_id)
@@ -349,30 +349,38 @@ def ad_click_handler(call):
         execute("UPDATE users SET pending_ads_required=0, pending_ads_completed=0, pending_movie_id=NULL WHERE user_id=?", (user_id,))
 
     # Foydalanuvchini reklama saytiga yo‘naltiramiz
-    ad_link = ad["link_url"]
-    bot.answer_callback_query(call.id, url=ad_link)
+    bot.answer_callback_query(call.id, url=ad["link_url"])
+# =========================================================
+# 2-QISM: Asosiy handlerlar, admin, universal handler
+# =========================================================
 
-# ---------- KINO YUBORISH ----------
 def send_movie_to_user(chat_id: int, user_id: int, movie):
-    """Kinoni yuboradi va bepul kinolar hisobini yangilaydi."""
-    new_views = movie["views"] + 1
-    execute("UPDATE movies SET views=? WHERE id=?", (new_views, movie["id"]))
-    execute("INSERT INTO watch_log(user_id, movie_id, watched_at) VALUES(?,?,?)", (user_id, movie["id"], now_text()))
-
-    # Bepul kinolar sonini oshirish (faqat reklamasiz bo‘lsa)
-    user = get_user(user_id)
-    if not user.get("pending_ads_required") or user["pending_ads_required"] == 0:
-        execute("UPDATE users SET free_movies_count = free_movies_count + 1 WHERE user_id=?", (user_id,))
-
+    """Kinoni yuboradi. Muvaffaqiyatli yuborilsa ko‘rishlar hisobini yangilaydi."""
     caption = (
         f"{movie['caption']}\n\n"
         f"🔢 Kod: <code>{safe(movie['code'])}</code>\n"
-        f"👁 Ko‘rilgan: <b>{new_views}</b> marta"
+        f"👁 Ko‘rilgan: <b>{movie['views'] + 1}</b> marta"
     )
-    if movie["file_type"] == "video":
-        bot.send_video(chat_id, movie["file_id"], caption=caption, supports_streaming=True)
-    else:
-        bot.send_document(chat_id, movie["file_id"], caption=caption)
+    try:
+        if movie["file_type"] == "video":
+            bot.send_video(chat_id, movie["file_id"], caption=caption, supports_streaming=True)
+        else:
+            bot.send_document(chat_id, movie["file_id"], caption=caption)
+    except Exception as e:
+        logging.exception(f"Kino yuborishda xato (movie_id={movie['id']}): {e}")
+        bot.send_message(chat_id, "❌ Kinoni yuklashda xatolik yuz berdi. Keyinroq urinib ko‘ring.")
+        return
+
+    # Yuborish muvaffaqiyatli bo‘lsa, hisoblagichlarni yangilash
+    execute("UPDATE movies SET views = views + 1 WHERE id = ?", (movie["id"],))
+    execute("INSERT INTO watch_log(user_id, movie_id, watched_at) VALUES(?,?,?)",
+            (user_id, movie["id"], now_text()))
+
+    # Bepul kinolar hisobi (reklamasiz yuborilganda)
+    user = get_user(user_id)
+    if not user.get("pending_ads_required") or user["pending_ads_required"] == 0:
+        execute("UPDATE users SET free_movies_count = free_movies_count + 1 WHERE user_id = ?", (user_id,))
+
 
 # ========== KINO QIDIRISH, MASHHURLAR, STATISTIKA, PROFIL ==========
 @bot.message_handler(func=lambda m: m.text == "🔎 Kino kodi")
@@ -578,6 +586,7 @@ def broadcast_copy(admin_chat_id, source_msg_id):
             success += 1
         except:
             failed += 1
+        time.sleep(0.05)
         if i % 100 == 0:
             try: bot.edit_message_text(f"📤 {i}/{len(users)}\n✅ {success} | ❌ {failed}", admin_chat_id, st.message_id)
             except: pass
@@ -627,7 +636,7 @@ def text_state_handler(message):
             bot.send_message(message.chat.id, "Admin panel yoki menyudan foydalaning.", reply_markup=admin_keyboard())
         return
 
-    # --- KINO KODI SO‘RALGAN ---
+    # --- KINO KODI ---
     if state == "waiting_movie_code":
         code = text
         movie = execute("SELECT * FROM movies WHERE code=?", (code,), fetchone=True)
@@ -636,17 +645,15 @@ def text_state_handler(message):
         if not movie:
             bot.send_message(message.chat.id, "❌ Bunday kodli kino topilmadi.", reply_markup=main_keyboard(user_id))
             return
-
         user = get_user(user_id)
         free_limit = int(get_setting("free_movies_limit"))
         free_count = user["free_movies_count"] or 0
-
         if free_count < free_limit:
             send_movie_to_user(message.chat.id, user_id, movie)
         else:
-            # Reklama talab qilinadi
             ads_needed = int(get_setting("ads_after_limit"))
-            execute("UPDATE users SET pending_ads_required=?, pending_ads_completed=0, pending_movie_id=? WHERE user_id=?", (ads_needed, movie["id"], user_id))
+            execute("UPDATE users SET pending_ads_required=?, pending_ads_completed=0, pending_movie_id=? WHERE user_id=?",
+                    (ads_needed, movie["id"], user_id))
             send_ad_message(message.chat.id, user_id, movie["id"])
         return
 
@@ -695,7 +702,8 @@ def text_state_handler(message):
             bot.send_message(message.chat.id, "❌ Ma'lumot buzilgan.")
             return
         file_type, file_id, title, caption = parts
-        execute("INSERT INTO movies(code,title,caption,file_id,file_type,created_at,added_by) VALUES(?,?,?,?,?,?,?)", (code, title, caption, file_id, file_type, now_text(), user_id))
+        execute("INSERT INTO movies(code,title,caption,file_id,file_type,created_at,added_by) VALUES(?,?,?,?,?,?,?)",
+                (code, title, caption, file_id, file_type, now_text(), user_id))
         clear_state(user_id)
         bot.send_message(message.chat.id, f"✅ <b>{safe(title)}</b> qo‘shildi. Kod: <code>{safe(code)}</code>", reply_markup=admin_keyboard())
         return
@@ -869,8 +877,6 @@ def telegram_webhook():
     except Exception:
         logging.exception("Webhook update qayta ishlashda xato")
         return jsonify({"ok": False}), 500
-
-# AdX1 reklama bosilishi callback orqali kuzatiladi – alohida postback yo‘q.
 
 def configure_webhook():
     init_db()
