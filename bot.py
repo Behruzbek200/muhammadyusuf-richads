@@ -438,7 +438,6 @@ def get_channels():
     return execute("SELECT * FROM channels ORDER BY id", fetchall=True)
 
 def check_subscription(user_id):
-    # Adminlar har doim o‘tkaziladi
     if is_admin(user_id):
         return True
 
@@ -447,18 +446,17 @@ def check_subscription(user_id):
         return True
 
     for ch in channels:
-        # Ochiq kanal – username orqali tekshiramiz
+        # Ochiq kanal – username orqali
         if ch.get("username"):
             try:
                 member = bot.get_chat_member(ch["username"], user_id)
-                if member.status in ["creator", "administrator", "member"]:
-                    continue
-                else:
+                if member.status not in ["creator", "administrator", "member"]:
                     return False
             except Exception:
-                pass
+                # Xatolik bo‘lsa, a’zo emas
+                return False
 
-        # Maxfiy kanal – chat_id orqali tekshiramiz
+        # Maxfiy kanal – chat_id orqali (join_requests)
         if ch.get("chat_id"):
             try:
                 member = bot.get_chat_member(ch["chat_id"], user_id)
@@ -466,7 +464,6 @@ def check_subscription(user_id):
                     continue
             except Exception:
                 pass
-            # Agar a'zo bo'lmasa, join_requests da borligini tekshiramiz
             req = execute(
                 "SELECT * FROM join_requests WHERE user_id = ? AND chat_id = ?",
                 (user_id, ch["chat_id"]), fetchone=True
@@ -475,7 +472,6 @@ def check_subscription(user_id):
                 return False
 
     return True
-
 def subscription_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=1)
     channels = get_channels()
@@ -500,17 +496,13 @@ def subscription_keyboard():
             kb.add(types.InlineKeyboardButton(f"🔒 {title} (so‘rov yuboring)", callback_data="noop"))
     kb.add(types.InlineKeyboardButton("✅ Obunani tekshirish", callback_data="check_subscription"))
     return kb
-
 def send_subscription_required(chat_id):
     channels = get_channels()
     if not channels:
         return
     text = "🔔 Botdan foydalanish uchun quyidagi kanallarga obuna bo‘ling:\n\n"
     kb = subscription_keyboard()
-    user = get_user(chat_id)
-    lang = user["language"] if user else "uz"
     bot.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
-
 @bot.chat_join_request_handler()
 def handle_join_request(req: types.ChatJoinRequest):
     try:
@@ -530,10 +522,10 @@ def check_sub_cb(call):
         except:
             pass
         lang = get_user(call.from_user.id)["language"] or "uz"
-        bot.send_message(call.message.chat.id, get_translation("subscription_ok", lang), reply_markup=main_keyboard(call.from_user.id))
+        bot.send_message(call.message.chat.id, get_translation("subscription_ok", lang),
+                         reply_markup=main_keyboard(call.from_user.id))
     else:
         bot.answer_callback_query(call.id, "Hali barcha kanallarga obuna bo‘lmadingiz yoki so‘rov yubormagansiz.", show_alert=True)
-
 def main_keyboard(uid):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add("🔎 Kino kodi", "🔥 Eng mashhur kinolar")
@@ -581,7 +573,6 @@ def ensure_access(message):
         send_subscription_required(message.chat.id)
         return False
     return True
-
 # ========== KINO YUBORISH ==========
 def send_movie_to_user(chat_id: int, user_id: int, movie, retry=2, use_bonus=False):
     caption = (
