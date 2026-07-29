@@ -60,7 +60,7 @@ def execute(q, p=(), fetchone=False, fetchall=False):
         finally: conn.close()
 
 def init_db():
-    # Users (8-qism: bonus_points, free_movies_earned qo'shildi)
+    # Users
     execute("""CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY, full_name TEXT DEFAULT '', username TEXT DEFAULT '',
         is_blocked INTEGER DEFAULT 0, joined_at TEXT, last_active TEXT,
@@ -150,7 +150,7 @@ def init_db():
         PRIMARY KEY (user_id, chat_id)
     )""")
 
-    # Default settings (8-qism: bonus_threshold)
+    # Default settings
     for k,v in [
         ("free_movies_limit", "3"),
         ("ads_after_limit", "2"),
@@ -165,11 +165,11 @@ def init_db():
         ("daily_ad_limit", "10"),
         ("hourly_ad_limit", "3"),
         ("notification_channel", ""),
-        ("bonus_threshold", "5"),   # 8-qism: nechta reklamadan keyin bonus kino
+        ("bonus_threshold", "5"),
     ]:
         execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k,v))
 
-    # Default translations (8-qism: yangi kalitlar)
+    # Default translations
     default_trans = {
         ("welcome", "uz"): "🎬 <b>Kino botga xush kelibsiz!</b>\nKerakli bo‘limni tanlang:",
         ("welcome", "ru"): "🎬 <b>Добро пожаловать в кинобот!</b>\nВыберите раздел:",
@@ -228,7 +228,6 @@ def init_db():
         ("no_rating", "uz"): "Bu kino hali baholanmagan.",
         ("no_rating", "ru"): "Этот фильм еще не оценен.",
         ("no_rating", "en"): "This movie is not rated yet.",
-        # 8-qism: yangi tarjimalar
         ("recommendations", "uz"): "🎯 <b>Sizga tavsiya etilgan kinolar</b>\n\n{list}",
         ("recommendations", "ru"): "🎯 <b>Рекомендуемые фильмы</b>\n\n{list}",
         ("recommendations", "en"): "🎯 <b>Recommended movies</b>\n\n{list}",
@@ -295,6 +294,7 @@ def normalize_channel_username(value: str) -> str:
     if value.startswith("https://"):
         return value
     return f"@{value}"
+
 # ========== AVTOMATIK KOD GENERATSIYASI ==========
 def generate_movie_code():
     max_id = execute("SELECT MAX(id) AS max_id FROM movies", fetchone=True)["max_id"] or 0
@@ -322,24 +322,18 @@ def check_ad_limit(user_id):
 
 # ========== 8-QISM: BONUS TIZIMI ==========
 def check_and_give_bonus(user_id):
-    """Foydalanuvchining bonus ballarini tekshiradi va agar threshold ga yetgan bo'lsa, bonus beradi."""
     threshold = int(get_setting("bonus_threshold"))
     user = get_user(user_id)
     if not user:
         return
-    # Jami reklamalar soni
     total_ads = execute("SELECT COUNT(*) AS c FROM ad_views WHERE user_id=? AND status='completed'", (user_id,), fetchone=True)["c"]
-    # Qancha bonus olgan
     earned = user["free_movies_earned"] or 0
-    # Hisoblash: necha marta threshold to'ldi
     new_earned = total_ads // threshold
     if new_earned > earned:
-        # Yangi bonuslar bor
         bonus_count = new_earned - earned
         execute("UPDATE users SET bonus_points = bonus_points + ?, free_movies_earned = ? WHERE user_id = ?", 
                 (bonus_count, new_earned, user_id))
         lang = user["language"] or "uz"
-        # Foydalanuvchiga xabar yuboramiz
         try:
             bot.send_message(user_id, get_translation("bonus_earned", lang).format(threshold=threshold))
         except Exception as e:
@@ -437,102 +431,113 @@ def ad_click_handler(call):
         bot.answer_callback_query(call.id, url=ad["link_url"])
     else:
         bot.answer_callback_query(call.id, "Reklama ko'rildi ✅")
-    # Bonus tekshirish
     check_and_give_bonus(user_id)
 
-# ========== MAJBURIY OBUNA ==========
+# ========== MAJBURIY OBUNA (TUZATILGAN) ==========
 def get_channels():
     return execute("SELECT * FROM channels ORDER BY id", fetchall=True)
 
 def check_subscription(user_id):
-    for ch in get_channels():
-        if ch["channel_type"] == "public":
+    # Adminlar har doim o‘tkaziladi
+    if is_admin(user_id):
+        return True
+
+    channels = get_channels()
+    if not channels:
+        return True
+
+    for ch in channels:
+        # Ochiq kanal – username orqali tekshiramiz
+        if ch.get("username"):
             try:
-                if ch["username"] and ch["username"].startswith("private_"):
-                    if not ch["chat_id"]: continue
-                    chat_id = ch["chat_id"]
-                elif ch["username"]:
-                    chat_id = ch["username"]
-                elif ch["chat_id"]:
-                    chat_id = ch["chat_id"]
-                else:
+                member = bot.get_chat_member(ch["username"], user_id)
+                if member.status in ["creator", "administrator", "member"]:
                     continue
-                member = bot.get_chat_member(chat_id, user_id)
-                if member.status not in ("creator","administrator","member"):
+                else:
                     return False
-            except ApiTelegramException as e:
-                logging.warning(f"Obuna tekshirishda kanal {ch['id']}: {e}")
-                return False
-            except Exception as e:
-                logging.error(f"Kutilmagan xato: {e}")
-                return False
-        else:
-            # Private kanal – faqat join_requests jadvalida borligi tekshiriladi
-            req = execute("SELECT 1 FROM join_requests WHERE user_id=? AND chat_id=?", (user_id, ch["chat_id"]), fetchone=True)
+            except Exception:
+                pass
+
+        # Maxfiy kanal – chat_id orqali tekshiramiz
+        if ch.get("chat_id"):
+            try:
+                member = bot.get_chat_member(ch["chat_id"], user_id)
+                if member.status in ["creator", "administrator", "member"]:
+                    continue
+            except Exception:
+                pass
+            # Agar a'zo bo'lmasa, join_requests da borligini tekshiramiz
+            req = execute(
+                "SELECT * FROM join_requests WHERE user_id = ? AND chat_id = ?",
+                (user_id, ch["chat_id"]), fetchone=True
+            )
             if not req:
-                logging.warning(f"Foydalanuvchi {user_id} private kanal {ch['id']} ga so'rov yubormagan.")
                 return False
+
     return True
+
 def subscription_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=1)
-    for ch in get_channels():
+    channels = get_channels()
+    if not channels:
+        return kb
+
+    for ch in channels:
         title = ch.get("title") or "Kanal"
-        if ch["channel_type"] == "public":
-            if ch.get("username") and not ch["username"].startswith("private_"):
-                name = ch["username"].replace("@","").strip()
-                if name:
-                    kb.add(types.InlineKeyboardButton(f"📢 {title}", url=f"https://t.me/{name}"))
-            elif ch.get("invite_link"):
-                kb.add(types.InlineKeyboardButton(f"📩 {title} – obuna bo‘lish", url=ch["invite_link"]))
-        else:
-            if ch.get("invite_link"):
+        if ch.get("invite_link"):
+            if ch.get("channel_type") == "public":
+                kb.add(types.InlineKeyboardButton(f"📢 {title}", url=ch["invite_link"]))
+            else:
                 kb.add(types.InlineKeyboardButton(f"🔒 {title} – so‘rov yuborish", url=ch["invite_link"]))
-            elif ch.get("username") and not ch["username"].startswith("private_"):
-                name = ch["username"].replace("@","").strip()
-                if name:
+        elif ch.get("username"):
+            name = ch["username"].replace("@", "")
+            if name:
+                if ch.get("channel_type") == "public":
+                    kb.add(types.InlineKeyboardButton(f"📢 {title}", url=f"https://t.me/{name}"))
+                else:
                     kb.add(types.InlineKeyboardButton(f"🔒 {title} – so‘rov yuborish", url=f"https://t.me/{name}"))
+        elif ch.get("chat_id"):
+            kb.add(types.InlineKeyboardButton(f"🔒 {title} (so‘rov yuboring)", callback_data="noop"))
     kb.add(types.InlineKeyboardButton("✅ Obunani tekshirish", callback_data="check_subscription"))
     return kb
+
 def send_subscription_required(chat_id):
+    channels = get_channels()
+    if not channels:
+        return
+    text = "🔔 Botdan foydalanish uchun quyidagi kanallarga obuna bo‘ling:\n\n"
     kb = subscription_keyboard()
     user = get_user(chat_id)
     lang = user["language"] if user else "uz"
-    bot.send_message(chat_id, get_translation("subscription_required", lang), reply_markup=kb)
+    bot.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
+
 @bot.chat_join_request_handler()
 def handle_join_request(req: types.ChatJoinRequest):
     try:
-        bot.approve_chat_join_request(req.chat.id, req.from_user.id)
         execute("INSERT OR IGNORE INTO join_requests VALUES(?,?,?)",
                 (req.from_user.id, req.chat.id, now_text()))
-    except ApiTelegramException as e:
-        if "bot is not a member" in str(e) or "chat_admin_required" in str(e):
-            logging.error(f"Bot kanalda admin emas! Kanal ID: {req.chat.id}")
-            for admin_id in ADMIN_IDS:
-                try:
-                    bot.send_message(admin_id, f"🚨 Bot {req.chat.id} kanalida admin emas! So‘rovlarni qabul qila olmaydi.")
-                except:
-                    pass
-        else:
-            logging.error(f"Join request xato: {e}")
+        logging.info(f"Join request recorded for user {req.from_user.id} in chat {req.chat.id}")
     except Exception as e:
         logging.error(f"Join request xato: {e}")
+
 @bot.callback_query_handler(func=lambda c: c.data == "check_subscription")
 def check_sub_cb(call):
     register_user(call.from_user)
     if check_subscription(call.from_user.id):
         bot.answer_callback_query(call.id, "Obuna tasdiqlandi ✅")
-        lang = get_user(call.from_user.id)["language"] or "uz"
         try:
-            bot.edit_message_text(get_translation("subscription_ok", lang), call.message.chat.id, call.message.message_id)
+            bot.delete_message(call.message.chat.id, call.message.message_id)
         except:
             pass
-        open_main_menu(call.message.chat.id, call.from_user.id)
+        lang = get_user(call.from_user.id)["language"] or "uz"
+        bot.send_message(call.message.chat.id, get_translation("subscription_ok", lang), reply_markup=main_keyboard(call.from_user.id))
     else:
-        bot.answer_callback_query(call.id, "Hali barcha kanallarga obuna bo‘lmadingiz yoki so‘rov yubormagansiz.", show_alert=True)# ---------- MENYULAR ----------
+        bot.answer_callback_query(call.id, "Hali barcha kanallarga obuna bo‘lmadingiz yoki so‘rov yubormagansiz.", show_alert=True)
+
 def main_keyboard(uid):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add("🔎 Kino kodi", "🔥 Eng mashhur kinolar")
-    kb.add("🎯 Tavsiyalar", "📊 Statistika", "💬 Adminga xabar", "👤 Profil")  # 8-qism: Tavsiyalar
+    kb.add("🎯 Tavsiyalar", "📊 Statistika", "💬 Adminga xabar", "👤 Profil")
     kb.add("🌐 Til")
     if is_admin(uid): kb.add("🛠 Admin panel")
     return kb
@@ -577,7 +582,7 @@ def ensure_access(message):
         return False
     return True
 
-# ========== KINO YUBORISH (8-qism: bonus ishlatish) ==========
+# ========== KINO YUBORISH ==========
 def send_movie_to_user(chat_id: int, user_id: int, movie, retry=2, use_bonus=False):
     caption = (
         f"{movie['caption']}\n\n"
@@ -599,9 +604,9 @@ def send_movie_to_user(chat_id: int, user_id: int, movie, retry=2, use_bonus=Fal
     for attempt in range(retry):
         try:
             if movie["file_type"] == "video":
-                sent = bot.send_video(chat_id, movie["file_id"], caption=caption, supports_streaming=True)
+                bot.send_video(chat_id, movie["file_id"], caption=caption, supports_streaming=True)
             else:
-                sent = bot.send_document(chat_id, movie["file_id"], caption=caption)
+                bot.send_document(chat_id, movie["file_id"], caption=caption)
             break
         except Exception as e:
             logging.exception(f"Kino yuborishda xato (urinish {attempt+1}): {e}")
@@ -615,7 +620,6 @@ def send_movie_to_user(chat_id: int, user_id: int, movie, retry=2, use_bonus=Fal
 
     user = get_user(user_id)
     if use_bonus:
-        # Bonus hisobdan ayirish
         execute("UPDATE users SET bonus_points = bonus_points - 1 WHERE user_id = ?", (user_id,))
         lang = user["language"] if user else "uz"
         remaining = execute("SELECT bonus_points FROM users WHERE user_id=?", (user_id,), fetchone=True)["bonus_points"] or 0
@@ -624,7 +628,6 @@ def send_movie_to_user(chat_id: int, user_id: int, movie, retry=2, use_bonus=Fal
         if not user.get("pending_ads_required") or user["pending_ads_required"] == 0:
             execute("UPDATE users SET free_movies_count = free_movies_count + 1 WHERE user_id = ?", (user_id,))
 
-    # Baholash va izoh tugmalari
     lang = user["language"] if user else "uz"
     existing = execute("SELECT id FROM reviews WHERE user_id=? AND movie_id=?", (user_id, movie["id"]), fetchone=True)
     if existing:
@@ -642,22 +645,18 @@ def recommendations_handler(message):
     if not ensure_access(message): return
     user_id = message.from_user.id
     lang = get_user(user_id)["language"] or "uz"
-    # Foydalanuvchi ko'rgan kinolarning kategoriyalarini aniqlaymiz
     watched_movies = execute("SELECT DISTINCT movie_id FROM watch_log WHERE user_id=?", (user_id,), fetchall=True)
     if not watched_movies:
         bot.send_message(message.chat.id, get_translation("no_recommendations", lang))
         return
     movie_ids = [m["movie_id"] for m in watched_movies]
     placeholders = ",".join("?" * len(movie_ids))
-    # Ushbu kinolarning kategoriyalarini olamiz
     cats = execute(f"SELECT DISTINCT category_id FROM movie_categories WHERE movie_id IN ({placeholders})", movie_ids, fetchall=True)
     if not cats:
-        # Agar kategoriya bo'lmasa, eng yaxshi reytingli kinolarni tavsiya qilamiz
         recs = execute("SELECT id, code, title, rating_sum, rating_count FROM movies WHERE rating_count > 0 ORDER BY CAST(rating_sum AS FLOAT)/rating_count DESC LIMIT 5", fetchall=True)
     else:
         cat_ids = [c["category_id"] for c in cats]
         placeholders2 = ",".join("?" * len(cat_ids))
-        # Shu kategoriyadagi, lekin foydalanuvchi ko'rmagan kinolar
         recs = execute(f"""SELECT m.id, m.code, m.title, m.rating_sum, m.rating_count
                           FROM movies m
                           JOIN movie_categories mc ON m.id = mc.movie_id
@@ -707,7 +706,6 @@ def search_filter_callback(call):
         bot.send_message(call.message.chat.id, "❌ Qidiruv bekor qilindi.", reply_markup=admin_keyboard())
         return
     if action == "go":
-        # Qidiruvni bajarish
         state, data = get_state(user_id)
         if not data:
             bot.answer_callback_query(call.id, "Hech qanday filtr tanlanmagan.")
@@ -716,12 +714,10 @@ def search_filter_callback(call):
         year = parts[0] if len(parts) > 0 and parts[0] != "0" else None
         genre = parts[1] if len(parts) > 1 and parts[1] != "0" else None
         rating = float(parts[2]) if len(parts) > 2 and parts[2] != "0" else None
-        # Qidiruv natijalarini ko'rsatish
         set_state(user_id, "admin_search_result_filters", data)
         send_search_page_with_filters(call.message.chat.id, user_id, 0, year, genre, rating)
         bot.answer_callback_query(call.id, "Qidiruv bajarildi")
         return
-    # Filtr tanlash
     if action == "year":
         set_state(user_id, "search_filter_year_wait", "year")
         bot.answer_callback_query(call.id, "Yilni kiriting (masalan 2024):")
@@ -740,10 +736,8 @@ def search_filter_value_handler(message):
     user_id = message.from_user.id
     state, data = get_state(user_id)
     value = message.text.strip()
-    # Saqlash
-    state_obj = get_state(user_id)  # (state, data)
+    state_obj = get_state(user_id)
     current_data = state_obj[1]
-    # current_data format: "year|genre|rating"
     parts = current_data.split("|") if current_data else ["0","0","0"]
     if state == "search_filter_year_wait":
         parts[0] = value if value != "0" else "0"
@@ -767,7 +761,6 @@ def search_filter_value_handler(message):
             return
         set_state(user_id, "admin_search_filters", "|".join(parts))
         bot.send_message(message.chat.id, f"✅ Reyting: {value if value != '0' else 'o‘tkazib yuborildi'}")
-    # Qaytadan filtrlar menyusini ko'rsatamiz
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(types.InlineKeyboardButton("📅 Yil", callback_data="search_filter_year"),
            types.InlineKeyboardButton("🎭 Janr", callback_data="search_filter_genre"),
@@ -790,12 +783,10 @@ def send_search_page_with_filters(chat_id, user_id, page, year=None, genre=None,
     if rating:
         query_parts.append("CAST(rating_sum AS FLOAT) / rating_count >= ?")
         params.append(float(rating))
-
     where = "WHERE " + " AND ".join(query_parts) if query_parts else ""
     count_query = f"SELECT COUNT(*) AS c FROM movies {where}"
     total = execute(count_query, params, fetchone=True)["c"]
     if rating:
-        # rating ni hisoblash uchun qo'shimcha
         select_query = f"""SELECT id, code, title, views, year, genre, rating_sum, rating_count,
                            CAST(rating_sum AS FLOAT) / rating_count AS avg_rating
                            FROM movies {where}
@@ -804,12 +795,10 @@ def send_search_page_with_filters(chat_id, user_id, page, year=None, genre=None,
         select_query = f"SELECT id, code, title, views, year, genre, rating_sum, rating_count FROM movies {where} ORDER BY id DESC LIMIT ? OFFSET ?"
     movies = execute(select_query, params + [per_page, offset], fetchall=True)
     total_pages = (total + per_page - 1) // per_page if total > 0 else 1
-
     if not movies:
         bot.send_message(chat_id, "❌ Hech qanday kino topilmadi.", reply_markup=movies_keyboard())
         clear_state(user_id)
         return
-
     lines = [f"🔎 <b>QIDIRUV NATIJALARI (sahifa {page+1}/{total_pages})</b>\n"]
     for m in movies:
         avg = round(m["rating_sum"] / m["rating_count"], 1) if m["rating_count"] > 0 else 0
@@ -818,14 +807,12 @@ def send_search_page_with_filters(chat_id, user_id, page, year=None, genre=None,
         rating_info = f" ⭐{avg}" if avg else ""
         lines.append(f"<b>{safe(m['title'])}{year_info}{genre_info}</b>\n   Kod: <code>{safe(m['code'])}</code> | 👁 {m['views']}{rating_info} | ID: {m['id']}")
     full = "\n\n".join(lines)
-
     kb = types.InlineKeyboardMarkup(row_width=2)
     if page > 0:
         kb.add(types.InlineKeyboardButton("⬅️ Oldingi", callback_data=f"search_page_f_{page-1}_{year or ''}_{genre or ''}_{rating or ''}"))
     if page < total_pages - 1:
         kb.add(types.InlineKeyboardButton("➡️ Keyingi", callback_data=f"search_page_f_{page+1}_{year or ''}_{genre or ''}_{rating or ''}"))
     kb.add(types.InlineKeyboardButton("🔄 Yangilash", callback_data=f"search_page_f_{page}_{year or ''}_{genre or ''}_{rating or ''}"))
-
     bot.send_message(chat_id, full, reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("search_page_f_"))
@@ -982,11 +969,9 @@ def send_movie_page(chat_id, user_id, page, filter_cat=None):
         movies = execute("SELECT id, code, title, views, year, genre, rating_count, rating_sum FROM movies ORDER BY id DESC LIMIT ? OFFSET ?", (per_page, offset), fetchall=True)
         total = execute("SELECT COUNT(*) AS c FROM movies", fetchone=True)["c"]
     total_pages = (total + per_page - 1) // per_page if total > 0 else 1
-
     if not movies:
         bot.send_message(chat_id, "Bu kategoriyada kinolar mavjud emas.", reply_markup=movies_keyboard())
         return
-
     lines = [f"📋 <b>BARCHA KINOLAR (sahifa {page+1}/{total_pages})</b>\n"]
     for m in movies:
         avg = round(m['rating_sum'] / m['rating_count'], 1) if m['rating_count'] > 0 else 0
@@ -995,14 +980,12 @@ def send_movie_page(chat_id, user_id, page, filter_cat=None):
         rating_info = f" ⭐{avg}" if avg else ""
         lines.append(f"ID: <code>{m['id']}</code> | <b>{safe(m['title'])}{year_info}{genre_info}</b>\n   Kod: <code>{safe(m['code'])}</code> | 👁 {m['views']}{rating_info}")
     full = "\n\n".join(lines)
-
     kb = types.InlineKeyboardMarkup(row_width=2)
     if page > 0:
         kb.add(types.InlineKeyboardButton("⬅️ Oldingi", callback_data=f"movie_page_{page-1}_{filter_cat or 'all'}"))
     if page < total_pages - 1:
         kb.add(types.InlineKeyboardButton("➡️ Keyingi", callback_data=f"movie_page_{page+1}_{filter_cat or 'all'}"))
     kb.add(types.InlineKeyboardButton("🔄 Yangilash", callback_data=f"movie_page_{page}_{filter_cat or 'all'}"))
-
     bot.send_message(chat_id, full, reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("movie_page_"))
@@ -1135,7 +1118,7 @@ def channel_delete_callback(call):
     bot.answer_callback_query(call.id)
     bot.send_message(call.message.chat.id, "🗑 O‘chiriladigan kanalning ID raqamini yoki username/linkini yuboring:")
 
-# ========== ADMIN: REKLAMA SOZLAMALARI (8-qism: bonus_threshold) ==========
+# ========== ADMIN: REKLAMA SOZLAMALARI ==========
 @bot.message_handler(func=lambda m: m.text == "⚙️ Reklama sozlamalari")
 def ad_settings(message):
     if not is_admin(message.from_user.id): return
@@ -1285,7 +1268,6 @@ def admin_statistics(message):
             top_text += f"{i}. {safe(name)} – {u['cnt']} marta (oxirgi: {u['last'][:10]})\n"
     else:
         top_text += "Hali ma'lumot yo'q."
-
     bot.send_message(message.chat.id,
         f"📊 <b>ADMIN STATISTIKA</b>\n\n"
         f"👥 Foydalanuvchilar: <b>{users}</b> (bloklangan: {blocked})\n"
@@ -1370,7 +1352,7 @@ def csv_back_callback(call):
     bot.answer_callback_query(call.id)
     bot.send_message(call.message.chat.id, "🛠 <b>Admin panel</b>", reply_markup=admin_keyboard())
 
-# ========== 8-QISM: ADMIN DASHBOARD (tavsiyalar bilan) ==========
+# ========== 8-QISM: ADMIN DASHBOARD ==========
 @bot.message_handler(func=lambda m: m.text == "📈 Dashboard")
 def admin_dashboard(message):
     if not is_admin(message.from_user.id): return
@@ -1385,12 +1367,10 @@ def admin_dashboard(message):
     most_reviewed = execute("""SELECT m.id, m.code, m.title, COUNT(r.id) AS cnt 
                                FROM movies m JOIN reviews r ON m.id = r.movie_id 
                                GROUP BY m.id ORDER BY cnt DESC LIMIT 5""", fetchall=True)
-
     text = "📈 <b>ADMIN DASHBOARD</b>\n\n"
     text += f"🎬 Jami kinolar: <b>{total_movies}</b>\n"
     text += f"👁 Jami ko‘rishlar: <b>{total_views}</b>\n"
     text += f"📝 Jami izohlar: <b>{total_reviews}</b>\n\n"
-
     text += "⭐ <b>Eng yaxshi reytingli kinolar</b>\n"
     if top_rated:
         for m in top_rated:
@@ -1398,21 +1378,18 @@ def admin_dashboard(message):
             text += f"  {avg} ⭐ {safe(m['title'])} (Kod: {safe(m['code'])})\n"
     else:
         text += "  Hali baholangan kino yo'q.\n"
-
     text += "\n👁 <b>Eng ko‘p ko‘rilgan kinolar</b>\n"
     if most_viewed:
         for m in most_viewed:
             text += f"  {m['views']} 👁 {safe(m['title'])} (Kod: {safe(m['code'])})\n"
     else:
         text += "  Hali ko'rilgan kino yo'q.\n"
-
     text += "\n📝 <b>Eng ko‘p izoh yozilgan kinolar</b>\n"
     if most_reviewed:
         for m in most_reviewed:
             text += f"  {m['cnt']} izoh | {safe(m['title'])} (Kod: {safe(m['code'])})\n"
     else:
         text += "  Hali izoh yo'q.\n"
-
     bot.send_message(message.chat.id, text)
 
 # ========== KANALGA BILDIRISHNOMA ==========
@@ -1438,7 +1415,7 @@ def notify_channel(movie):
         logging.error(f"Kanalga xabar yuborishda xato: {e}")
         notify_admins_about_error(f"Kanalga bildirishnoma yuborishda xato: {e}")
 
-# ========== UNIVERSAL MATN HANDLER ==========
+# ========== UNIVERSAL MATN HANDLER (TUZATILGAN) ==========
 @bot.message_handler(commands=["cancel"])
 def cancel_handler(message):
     clear_state(message.from_user.id)
@@ -1453,7 +1430,6 @@ def text_state_handler(message):
     state, data = get_state(user_id)
     lang = get_user(user_id)["language"] if get_user(user_id) else "uz"
 
-    # Agar hech qanday holat bo'lmasa, asosiy menyuni ko'rsatamiz
     if not state:
         if not is_admin(user_id):
             bot.send_message(message.chat.id, get_translation("welcome", lang), reply_markup=main_keyboard(user_id))
@@ -1853,7 +1829,7 @@ def text_state_handler(message):
         clear_state(user_id)
         return
 
-    # ========== IZOH QOLDIRISH (waiting_review) ==========
+    # ========== IZOH QOLDIRISH ==========
     if state == "waiting_review":
         movie_id = int(data)
         if len(text) > 500:
@@ -1868,7 +1844,7 @@ def text_state_handler(message):
         bot.send_message(message.chat.id, get_translation("review_saved", lang))
         return
 
-    # ========== QIDIRUV FILTRI (admin) ==========
+    # ========== QIDIRUV FILTRI ==========
     if state in ["search_filter_year_wait", "search_filter_genre_wait", "search_filter_rating_wait"] and is_admin(user_id):
         current_data = data
         parts = current_data.split("|") if current_data else ["0","0","0"]
@@ -1894,7 +1870,6 @@ def text_state_handler(message):
                 return
             set_state(user_id, "admin_search_filters", "|".join(parts))
             bot.send_message(message.chat.id, f"✅ Reyting: {text if text != '0' else 'o‘tkazib yuborildi'}")
-        # Qaytadan filtrlar menyusini ko'rsatamiz
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.add(types.InlineKeyboardButton("📅 Yil", callback_data="search_filter_year"),
                types.InlineKeyboardButton("🎭 Janr", callback_data="search_filter_genre"),
@@ -1904,8 +1879,8 @@ def text_state_handler(message):
         bot.send_message(message.chat.id, "Filtrlarni davom ettiring yoki 'Qidirish' tugmasini bosing.", reply_markup=kb)
         return
 
-    # ========== BOSHQA HOLATLAR ==========
     bot.send_message(message.chat.id, "❌ Noto‘g‘ri ma’lumot. /cancel bilan bekor qiling.")
+
 # ========== CALLBACK HANDLERLAR ==========
 @bot.callback_query_handler(func=lambda c: c.data.startswith("edit_"))
 def edit_movie_callback(call):
@@ -1971,7 +1946,6 @@ def edit_movie_value_handler(message):
     clear_state(user_id)
     bot.send_message(message.chat.id, f"✅ <b>Kino muvaffaqiyatli yangilandi.</b>", reply_markup=movies_keyboard())
 
-# Kategoriya biriktirish callback
 @bot.callback_query_handler(func=lambda c: c.data.startswith("assign_cat_"))
 def assign_category_callback(call):
     if not is_admin(call.from_user.id):
