@@ -22,7 +22,7 @@ def send_ad_to_user(message):
     
     # RichAds hujjatlariga mos to'liq payload formati
     payload = {
-        "language_code": "uz",
+        "language_code": "en",
         "publisher_id": PUBLISHER_ID,
         "widget_id": WIDGET_ID,
         "telegram_id": str(chat_id),
