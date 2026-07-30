@@ -26,7 +26,7 @@ def send_ad_to_user(message):
         "publisher_id": PUBLISHER_ID,
         "widget_id": WIDGET_ID,
         "telegram_id": str(chat_id),
-        "production": False  # Sinov uchun false, tayyor bo'lganda true qilasiz
+        "production": True  # Sinov uchun false, tayyor bo'lganda true qilasiz
     }
     
     try:
