@@ -3,7 +3,7 @@ import telebot
 import requests
 from flask import Flask, request, abort
 
-TOKEN = "BOT_TOKENINGIZNI_SHU_YERGA_YOZING"
+TOKEN = "8619014948:AAGuiOhk_UpKaD30PghNmWwqAivEMz-AKHU"
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
