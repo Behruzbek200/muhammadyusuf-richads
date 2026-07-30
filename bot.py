@@ -8,7 +8,7 @@ bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
 # Render'dagi veb-ilovangizning tashqi havolasi (Masalan: https://sizning-servis.onrender.com)
-RENDER_URL = "https://sizning-servis-nomingiz.onrender.com"
+RENDER_URL = "https://muhammadyusuf-richads.onrender.com"
 WEBHOOK_URL_PATH = f"/{TOKEN}"
 WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_URL_PATH}"
 
