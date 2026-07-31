@@ -13,7 +13,7 @@ from io import BytesIO
 from flask import Flask, request
 import telebot
 from telebot import types
-from googletrans import Translator
+from deep_translator import GoogleTranslator  # googletrans o‘rniga
 
 # ---------------------- KONFIGURATSIYA (ENV) ----------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # ---------------------- BOT, FLASK, TRANSLATOR ----------------------
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
-translator = Translator()
+translator = GoogleTranslator()  # deep-translator obyekti
 app = Flask(__name__)
 
 # ---------------------- SQLITE MA'LUMOTLAR BAZASI ----------------------
@@ -602,7 +602,8 @@ def handle_callback(call):
             return
 
         try:
-            translated = translator.translate(text_to_translate, dest=target_lang).text
+            # deep-translator usuli
+            translated = translator.translate(text_to_translate, target=target_lang)
         except Exception as e:
             logger.error(f"Tarjima xatosi: {e}")
             bot.answer_callback_query(call.id, text="❌ Tarjima xatosi.")
