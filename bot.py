@@ -1,6 +1,6 @@
 # ===================================================================
 #         TARJIMON BOT – FAQAT TUGMALAR, ADSGRAM INTEGRATSIYASI
-#                   /start va /admin handlerlari bilan
+#                      TO‘LIQ ISHLAYDI
 # ===================================================================
 
 import os
@@ -16,20 +16,22 @@ import telebot
 from telebot import types
 from deep_translator import GoogleTranslator
 
-# ---------------------- KONFIGURATSIYA (ENV) ----------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+# ---------------------- KONFIGURATSIYA ----------------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "123456789"))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")          # https://your-app.onrender.com/webhook
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://your-app.onrender.com/webhook
 ADSGRAM_AD_UNIT_ID = os.environ.get("ADSGRAM_AD_UNIT_ID", "YOUR_AD_UNIT_ID")
-ADSGRAM_CALLBACK_URL = os.environ.get("ADSGRAM_CALLBACK_URL", WEBHOOK_URL.replace("/webhook", "/adsgram_callback"))
 
-if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required!")
 if not WEBHOOK_URL:
     raise ValueError("WEBHOOK_URL environment variable is required!")
 
 # ---------------------- LOGGER ----------------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # ---------------------- BOT, FLASK, TRANSLATOR ----------------------
@@ -37,7 +39,7 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 translator = GoogleTranslator()
 app = Flask(__name__)
 
-# ---------------------- SQLITE MA'LUMOTLAR BAZASI ----------------------
+# ---------------------- SQLITE ----------------------
 DB_NAME = 'translator_bot.db'
 
 def init_db():
@@ -70,7 +72,7 @@ def init_db():
     conn.close()
     logger.info("Ma'lumotlar bazasi tayyorlandi.")
 
-# ---------------------- DB YORDAMCHI FUNKSIYALAR ----------------------
+# ---------------------- DB YORDAMCHILARI ----------------------
 def get_user(user_id):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -195,7 +197,6 @@ def increment_daily_ads():
     conn.commit()
     conn.close()
 
-# ---------------------- AVTOMATIK KUNLIK RESET ----------------------
 def check_daily_reset_db():
     stats = get_stats()
     if stats:
@@ -208,7 +209,7 @@ def check_daily_reset_db():
 # ---------------------- VAQTINCHALIK MA'LUMOTLAR ----------------------
 temp_data = {}
 
-# ---------------------- KENGAYTIRILGAN FAYL YARATISH ----------------------
+# ---------------------- FAYL YARATISH ----------------------
 def create_translation_file(text, format_type='txt'):
     if format_type == 'txt':
         file_io = BytesIO()
@@ -379,7 +380,7 @@ def get_admin_keyboard(lang='uz'):
     keyboard.add(btn1, btn2, btn3, btn4, btn5, btn6)
     return keyboard
 
-# ---------------------- HANDLERLAR (buyruqlar) ----------------------
+# ---------------------- BOT HANDLERLAR ----------------------
 @bot.message_handler(commands=['start'])
 def start_command(message):
     user_id = message.from_user.id
@@ -394,6 +395,7 @@ def start_command(message):
         "Assalomu alaykum! Men tarjimon botman. Quyidagi menyudan foydalaning:",
         reply_markup=get_main_menu_keyboard(lang, user_id)
     )
+    logger.info(f"User {user_id} started bot")
 
 @bot.message_handler(commands=['admin'])
 def admin_command(message):
@@ -408,12 +410,11 @@ def admin_command(message):
         reply_markup=get_admin_keyboard(lang)
     )
 
-# ---------------------- MATN VA FAYL HANDLERLARI ----------------------
 @bot.message_handler(func=lambda message: True, content_types=['text'])
 def handle_text(message):
     user_id = message.from_user.id
     text = message.text
-    # Agar buyruq bo'lsa, uni e'tiborsiz qoldiramiz (chunki ular yuqorida ishlov olgan)
+    # Buyruqlarni e'tiborsiz qoldiramiz (ular maxsus handlerlar tomonidan ishlov oladi)
     if text.startswith('/'):
         return
 
@@ -506,8 +507,7 @@ def handle_document(message):
         reply_markup=get_translation_languages_keyboard()
     )
 
-# ---------------------- CALLBACK HANDLER (TO'LIQ) ----------------------
-# (bu qism avvalgidek, hech qanday o'zgarish yo'q)
+# ---------------------- CALLBACK HANDLER ----------------------
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     user_id = call.from_user.id
@@ -732,7 +732,7 @@ def handle_callback(call):
         reset_daily_ads_db()
         bot.answer_callback_query(call.id, text="✅ Kunlik reklama tiklandi!")
 
-# ---------------------- ADMIN STEP FUNKSIYALARI ----------------------
+# ---------------------- ADMIN STEP ----------------------
 def admin_add_limit_step(message):
     if message.from_user.id != ADMIN_ID:
         return
@@ -867,7 +867,7 @@ def adsgram_callback():
         logger.error(f"Adsgram callback xatosi: {e}")
         return "Error", 500
 
-# ---------------------- WEBHOOK ENDPOINT ----------------------
+# ---------------------- WEBHOOK ----------------------
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
