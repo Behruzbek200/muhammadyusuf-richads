@@ -11,7 +11,7 @@ RENDER_URL = "https://muhammadyusuf-richads.onrender.com"
 WEBHOOK_URL_PATH = f"/{TOKEN}"
 WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_URL_PATH}"
 
-# RichAds API sozlamalari (Hujjatdagi manzil va parametrlar)
+# RichAds API sozlamalari
 RICHADS_URL = "http://15068.xml.adx1.com/telegram-mb"
 PUBLISHER_ID = "1018576"
 WIDGET_ID = "402831"
@@ -20,13 +20,30 @@ WIDGET_ID = "402831"
 def send_ad_to_user(message):
     chat_id = message.chat.id
     
-    # RichAds hujjatlariga mos to'liq payload formati
+    # 220 tadan ortiq barcha tillarni qamrab olish uchun massiv ko'rinishida beramiz
+    languages = [
+        "ab", "aa", "af", "ak", "sq", "am", "ar", "an", "hy", "as", "av", "ae", "ay", "az", 
+        "bm", "ba", "eu", "be", "bn", "bh", "bi", "bs", "br", "bg", "my", "ca", "ch", "ce", 
+        "ny", "zh", "cu", "cv", "kw", "co", "cr", "hr", "cs", "da", "dv", "nl", "dz", "en", 
+        "eo", "et", "ee", "fo", "fj", "fi", "fr", "ff", "gl", "ka", "de", "el", "gn", "gu", 
+        "ht", "ha", "he", "hz", "hi", "ho", "hu", "is", "io", "ig", "id", "ia", "ie", "iu", 
+        "ik", "ga", "it", "ja", "jv", "kn", "kr", "ks", "kk", "km", "ki", "rw", "ky", "kv", 
+        "kg", "ko", "ku", "kj", "la", "lb", "lg", "li", "ln", "lo", "lt", "lu", "lv", "gv", 
+        "mk", "mg", "ms", "ml", "mt", "mi", "mr", "mh", "mn", "na", "nv", "nd", "ne", "ng", 
+        "nb", "nn", "no", "ii", "nr", "oc", "oj", "cu", "or", "om", "os", "pa", "pi", "fa", 
+        "pl", "ps", "pt", "qu", "rm", "rn", "ro", "ru", "sa", "sc", "sd", "se", "sm", "sg", 
+        "sr", "gd", "sn", "si", "sk", "sl", "so", "st", "es", "su", "sw", "ss", "sv", "ta", 
+        "te", "tg", "th", "ti", "bo", "tk", "tl", "tn", "to", "tr", "ts", "tt", "tw", "ty", 
+        "ug", "uk", "ur", "uz", "ve", "vi", "vo", "wa", "cy", "wo", "fy", "xh", "yi", "yo", 
+        "za", "zu"
+    ]
+    
     payload = {
-        "language_code": "en",
+        "language_code": languages,  # Barcha tillar ro'yxati
         "publisher_id": PUBLISHER_ID,
         "widget_id": WIDGET_ID,
         "telegram_id": str(chat_id),
-        "production": True  # Sinov uchun false, tayyor bo'lganda true qilasiz
+        "production": True  # Haqiqiy reklama uchun True
     }
     
     try:
@@ -82,3 +99,4 @@ if __name__ == "__main__":
     bot.set_webhook(url=WEBHOOK_URL)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+    
