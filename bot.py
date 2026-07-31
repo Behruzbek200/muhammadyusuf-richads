@@ -1,5 +1,6 @@
 # ===================================================================
 #         TARJIMON BOT – FAQAT TUGMALAR, ADSGRAM INTEGRATSIYASI
+#                   /start va /admin handlerlari bilan
 # ===================================================================
 
 import os
@@ -13,7 +14,7 @@ from io import BytesIO
 from flask import Flask, request
 import telebot
 from telebot import types
-from deep_translator import GoogleTranslator  # googletrans o‘rniga
+from deep_translator import GoogleTranslator
 
 # ---------------------- KONFIGURATSIYA (ENV) ----------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 # ---------------------- BOT, FLASK, TRANSLATOR ----------------------
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
-translator = GoogleTranslator()  # deep-translator obyekti
+translator = GoogleTranslator()
 app = Flask(__name__)
 
 # ---------------------- SQLITE MA'LUMOTLAR BAZASI ----------------------
@@ -205,7 +206,7 @@ def check_daily_reset_db():
     threading.Timer(3600, check_daily_reset_db).start()
 
 # ---------------------- VAQTINCHALIK MA'LUMOTLAR ----------------------
-temp_data = {}  # {user_id: {'temp_text': ..., 'is_file': ..., 'translated_text': ..., 'target_lang': ...}}
+temp_data = {}
 
 # ---------------------- KENGAYTIRILGAN FAYL YARATISH ----------------------
 def create_translation_file(text, format_type='txt'):
@@ -378,13 +379,42 @@ def get_admin_keyboard(lang='uz'):
     keyboard.add(btn1, btn2, btn3, btn4, btn5, btn6)
     return keyboard
 
-# ---------------------- BOT HANDLERLAR (FAQAT TUGMALAR) ----------------------
-# Matn xabarlari – tarjima uchun
+# ---------------------- HANDLERLAR (buyruqlar) ----------------------
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    if not user:
+        create_or_update_user(user_id, 'uz')
+        lang = 'uz'
+    else:
+        lang = user['lang']
+    bot.send_message(
+        message.chat.id,
+        "Assalomu alaykum! Men tarjimon botman. Quyidagi menyudan foydalaning:",
+        reply_markup=get_main_menu_keyboard(lang, user_id)
+    )
+
+@bot.message_handler(commands=['admin'])
+def admin_command(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        bot.reply_to(message, "⛔ Siz admin emassiz!")
+        return
+    lang = get_user_lang_db(user_id)
+    bot.send_message(
+        message.chat.id,
+        "🔐 Admin paneliga xush kelibsiz!",
+        reply_markup=get_admin_keyboard(lang)
+    )
+
+# ---------------------- MATN VA FAYL HANDLERLARI ----------------------
 @bot.message_handler(func=lambda message: True, content_types=['text'])
 def handle_text(message):
     user_id = message.from_user.id
     text = message.text
-    if text.startswith('/'):  # buyruqlarni e'tiborsiz qoldiramiz
+    # Agar buyruq bo'lsa, uni e'tiborsiz qoldiramiz (chunki ular yuqorida ishlov olgan)
+    if text.startswith('/'):
         return
 
     user = get_user(user_id)
@@ -416,7 +446,6 @@ def handle_text(message):
         reply_markup=get_translation_languages_keyboard()
     )
 
-# Fayl xabarlari
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     user_id = message.from_user.id
@@ -477,7 +506,8 @@ def handle_document(message):
         reply_markup=get_translation_languages_keyboard()
     )
 
-# ---------------------- CALLBACK HANDLER ----------------------
+# ---------------------- CALLBACK HANDLER (TO'LIQ) ----------------------
+# (bu qism avvalgidek, hech qanday o'zgarish yo'q)
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     user_id = call.from_user.id
@@ -497,7 +527,7 @@ def handle_callback(call):
         )
         return
 
-    # Asosiy menyu tugmalari
+    # Asosiy menyu
     if data == "limit":
         user = get_user(user_id)
         if user:
@@ -549,9 +579,8 @@ def handle_callback(call):
         )
         return
 
-    # ---------------------- REKLAMA KO'RISH (ADSGRAM) ----------------------
+    # Reklama ko'rish (adsgram)
     if data == "watch_ad":
-        # Kunlik limitni tekshirish
         stats = get_stats()
         if not stats:
             bot.answer_callback_query(call.id, text="❌ Statistika xatosi.")
@@ -561,9 +590,7 @@ def handle_callback(call):
             bot.answer_callback_query(call.id, text="❌ Bugungi reklama limiti tugagan. Ertaga urinib ko'ring.")
             return
 
-        # Adsgram manzilini tayyorlash
         ad_link = f"https://t.me/adsgram_bot?start=reward_{ADSGRAM_AD_UNIT_ID}_{user_id}"
-        # Foydalanuvchini adsgram botiga yo'naltiramiz
         bot.send_message(
             call.message.chat.id,
             f"🎥 Reklamani ko'rish uchun quyidagi tugmani bosing:\n\n👉 {ad_link}",
@@ -571,15 +598,13 @@ def handle_callback(call):
                 types.InlineKeyboardButton("📺 Reklamani ko'rish", url=ad_link)
             )
         )
-        # Foydalanuvchini kutish holatiga o'tkazamiz (callback adsgramdan kelganda ishlov beriladi)
-        # Vaqtinchalik ma'lumotda reklama kutish holatini belgilaymiz
         if user_id not in temp_data:
             temp_data[user_id] = {}
         temp_data[user_id]['waiting_ad'] = True
         bot.answer_callback_query(call.id, text="Reklama ko'rish uchun havola yuborildi.")
         return
 
-    # ---------------------- TARJIMA TILLARI ----------------------
+    # Tarjima tillari
     if data.startswith('trans_'):
         target_lang = data.split('_')[1]
         user_temp = temp_data.get(user_id, {})
@@ -602,7 +627,6 @@ def handle_callback(call):
             return
 
         try:
-            # deep-translator usuli
             translated = translator.translate(text_to_translate, target=target_lang)
         except Exception as e:
             logger.error(f"Tarjima xatosi: {e}")
@@ -622,7 +646,7 @@ def handle_callback(call):
         )
         return
 
-    # ---------------------- NATIJA FORMATI ----------------------
+    # Natija formati
     if data.startswith('result_'):
         result_type = data.split('_')[1]
         user_temp = temp_data.get(user_id, {})
@@ -663,13 +687,12 @@ def handle_callback(call):
             finally:
                 file_io.close()
 
-        # Vaqtinchalik ma'lumotlarni tozalash
         temp_data[user_id].pop('translated_text', None)
         temp_data[user_id].pop('target_lang', None)
         temp_data[user_id].pop('temp_text', None)
         return
 
-    # ---------------------- ADMIN PANELI ----------------------
+    # Admin paneli
     if data == "admin_panel":
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, text="⛔ Ruxsat yo'q!")
@@ -799,33 +822,19 @@ def show_ad_settings(message):
     """
     bot.send_message(message.chat.id, text, parse_mode='Markdown')
 
-# ---------------------- ADSGRAM CALLBACK ENDPOINT ----------------------
+# ---------------------- ADSGRAM CALLBACK ----------------------
 @app.route('/adsgram_callback', methods=['POST'])
 def adsgram_callback():
-    """
-    Adsgram bot yoki veb-interfeys tomonidan yuboriladigan callback.
-    Kutilayotgan format (misol):
-    {
-        "user_id": 123456789,
-        "status": "completed",  // yoki "cancelled", "error"
-        "reward": 5,
-        "ad_unit_id": "..."
-    }
-    """
     try:
         data = request.get_json()
         if not data:
             return "Invalid JSON", 400
-
         user_id = data.get('user_id')
         status = data.get('status')
         reward = data.get('reward', 5)
-
         if not user_id:
             return "Missing user_id", 400
-
         logger.info(f"Adsgram callback: user={user_id}, status={status}, reward={reward}")
-
         if status == 'completed':
             user = get_user(user_id)
             if user:
@@ -834,7 +843,6 @@ def adsgram_callback():
                 update_user_limit(user_id, new_limit)
                 update_user_ads(user_id, new_ads)
                 increment_daily_ads()
-                # Foydalanuvchiga xabar yuboramiz
                 try:
                     lang = get_user_lang_db(user_id)
                     bot.send_message(
@@ -847,7 +855,6 @@ def adsgram_callback():
             else:
                 logger.warning(f"Adsgram callback: user {user_id} topilmadi.")
         else:
-            # Boshqa holatlar (bekor qilingan, xato)
             try:
                 bot.send_message(
                     user_id,
@@ -855,7 +862,6 @@ def adsgram_callback():
                 )
             except:
                 pass
-
         return "OK", 200
     except Exception as e:
         logger.error(f"Adsgram callback xatosi: {e}")
